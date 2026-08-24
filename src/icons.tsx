@@ -3,6 +3,7 @@ import type { ReactNode, SVGProps } from "react";
 export type IconName =
   | "box"
   | "brush"
+  | "circle"
   | "clear"
   | "cube"
   | "download"
@@ -36,6 +37,7 @@ export function Icon({ name, ...props }: IconProps) {
   const paths: Record<IconName, ReactNode> = {
     box: <><path d="M4 6.5 12 2l8 4.5v10L12 21l-8-4.5z"/><path d="m4 6.5 8 4.5 8-4.5M12 11v10"/></>,
     brush: <><path d="M4 17.5 16.5 5a2.1 2.1 0 0 1 3 3L7 20.5H3.5z"/><path d="m13.5 8 3 3"/></>,
+    circle: <><circle cx="12" cy="12" r="8.5"/><path d="M12 12h8.5"/></>,
     clear: <><path d="M4 7h16M9 7V4h6v3m-8 0 1 14h8l1-14M10 11v6m4-6v6"/></>,
     cube: <><path d="m12 2 8 4.5v11L12 22l-8-4.5v-11z"/><path d="m4 6.5 8 4.5 8-4.5M12 11v11"/></>,
     download: <><path d="M12 3v12m-4-4 4 4 4-4"/><path d="M5 20h14"/></>,

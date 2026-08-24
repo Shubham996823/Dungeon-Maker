@@ -1,4 +1,4 @@
-# 3d-builder
+# Dungeon-Maker
 
 A browser version of the MoR Square Grid Builder. Users draw occupied 2 m cells directly inside the Three.js assembly viewport while it builds the floor, exterior walls, corner modules, and optional pillars.
 

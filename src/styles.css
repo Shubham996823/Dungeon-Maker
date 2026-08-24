@@ -71,7 +71,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .section-heading span { color: var(--accent); font: 700 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .section-heading h2 { margin: 0; color: #252a26; font-family: "Arial Narrow", "Avenir Next Condensed", sans-serif; font-size: 12px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase; }
 
-.tool-grid { display: grid; grid-template-columns: repeat(2, 1fr); border: 1px solid #c8c1b5; }
+.tool-grid { display: grid; grid-template-columns: repeat(4, 1fr); border: 1px solid #c8c1b5; }
 .tool-grid button { position: relative; min-width: 0; height: 67px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; border: 0; border-right: 1px solid #c8c1b5; background: #f1ede4; color: #585f58; cursor: pointer; }
 .tool-grid button:last-child { border-right: 0; }
 .tool-grid button:hover { background: #e8e3d9; }
@@ -80,6 +80,14 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .tool-grid kbd { position: absolute; top: 5px; right: 6px; color: #9da299; background: transparent; font: 8px ui-monospace, monospace; }
 .tool-grid button.active kbd { color: #767f77; }
 .control-help { margin: 11px 0 0; color: #747a73; font-size: 10.5px; line-height: 1.5; }
+
+.selected-room-label { min-height: 34px; padding: 0 8px; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #f5f1e9; background: var(--ink-2); }
+.selected-room-label span { color: #9aa198; font-size: 9px; font-weight: 750; text-transform: uppercase; }
+.selected-room-label b { max-width: 125px; overflow: hidden; color: var(--lime); font: 700 9px ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.corner-actions { margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.corner-actions button { min-height: 36px; padding: 6px 8px; border: 1px solid #c9c2b6; background: #f1ede4; color: #4f554f; font-size: 9px; font-weight: 750; cursor: pointer; }
+.corner-actions button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-dark); }
+.corner-actions kbd { margin-left: 3px; color: #8e948c; background: transparent; font: 8px ui-monospace, monospace; }
 
 .history-row { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-top: 12px; }
 .history-row button, .plan-actions button { height: 34px; display: flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid #c9c2b6; background: transparent; color: #4f554f; font-size: 10px; font-weight: 700; cursor: pointer; }
@@ -137,7 +145,9 @@ button:disabled { opacity: .38; cursor: not-allowed; }
 .three-viewport { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
 .three-viewport canvas { width: 100%; height: 100%; display: block; touch-action: none; }
 .three-viewport.tool-draw canvas { cursor: crosshair; }
+.three-viewport.tool-circle canvas { cursor: crosshair; }
 .three-viewport.tool-erase canvas { cursor: cell; }
+.three-viewport.tool-select canvas { cursor: pointer; }
 .view-controls { position: absolute; z-index: 5; top: 12px; right: 12px; display: flex; border: 1px solid #39413b; box-shadow: 0 6px 20px rgba(0,0,0,.22); }
 .view-controls button { width: 34px; height: 32px; display: grid; place-items: center; padding: 0; border: 0; border-right: 1px solid #3b433d; cursor: pointer; backdrop-filter: blur(8px); }
 .view-controls button:last-child { border-right: 0; }
@@ -147,6 +157,8 @@ button:disabled { opacity: .38; cursor: not-allowed; }
 .active-tool-label { position: absolute; z-index: 5; top: 12px; left: 13px; height: 28px; padding: 0 10px; display: flex; align-items: center; gap: 7px; color: #d8ddd8; background: rgba(29, 34, 30, .88); border: 1px solid #39413b; font: 700 8.5px ui-monospace, monospace; letter-spacing: .08em; text-transform: uppercase; pointer-events: none; backdrop-filter: blur(8px); }
 .active-tool-label i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
 .active-tool-label.erase i { background: #e25d50; }
+.active-tool-label.select i { background: var(--lime); }
+.active-tool-label.circle i { border-radius: 50%; background: #6fa8dc; }
 .draft-measure { position: absolute; z-index: 5; top: 48px; left: 13px; padding: 6px 9px; color: #f3eee6; background: rgba(207, 92, 61, .9); font: 700 9px ui-monospace, monospace; pointer-events: none; }
 .draft-measure[hidden] { display: none; }
 .orbit-hint { position: absolute; right: 13px; bottom: 11px; color: #788078; font: 600 8.5px ui-monospace, monospace; pointer-events: none; }
@@ -154,6 +166,16 @@ button:disabled { opacity: .38; cursor: not-allowed; }
 .empty-3d svg { width: 30px; height: 30px; color: #3f4841; }
 .three-loading { min-height: 0; display: grid; place-content: center; justify-items: center; gap: 10px; color: #6f7871; background: #131715; font-size: 10px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
 .three-loading svg { width: 28px; height: 28px; color: #465048; }
+
+.asset-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.asset-grid figure { margin: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 5px; background: #f3f0e8; }
+.asset-grid img { display: block; width: 100%; aspect-ratio: 1.6; object-fit: cover; }
+.asset-grid figcaption { padding: 5px 7px; color: #535b54; font-size: 10px; font-weight: 700; }
+.asset-actions { display: grid; grid-template-columns: 1fr 1fr; border-top: 1px solid var(--line); }
+.asset-actions.ground-actions { grid-template-columns: repeat(3, 1fr); }
+.asset-actions button { min-height: 25px; padding: 3px; border: 0; border-right: 1px solid var(--line); background: transparent; color: #4f5c52; font-size: 9px; font-weight: 800; cursor: pointer; }
+.asset-actions button:last-child { border-right: 0; }
+.asset-actions button:hover { background: var(--lime); color: #202622; }
 
 .metrics-strip { min-width: 0; display: grid; grid-template-columns: repeat(6, minmax(85px, 1fr)); background: var(--ink-2); border-top: 1px solid #353a36; overflow-x: auto; }
 .metrics-strip > div { min-width: 0; padding: 11px 15px; display: flex; flex-direction: column; justify-content: center; border-right: 1px solid #3a3f3b; }
