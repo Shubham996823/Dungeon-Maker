@@ -11,6 +11,7 @@ import type {
   RadiusHandle,
   Room,
   RoomGround,
+  WallResizeHandle,
 } from "./types";
 
 const EPSILON = 1e-6;
@@ -49,6 +50,113 @@ export interface EditedRoomGeometry {
   handles: CornerHandle[];
   radiusHandles: RadiusHandle[];
   pillarAnchors: PillarAnchor[];
+  wallResizeHandles: WallResizeHandle[];
+}
+
+/**
+ * Boolean-union completed room outlines. This deliberately happens after each room has
+ * applied its own diagonal/curve edits: merging raw cells first loses the true boundary
+ * and is the cause of the broken joins between curved and diagonal rooms.
+ */
+export function unionFinishedRoomGeometry(roomId: string, geometries: EditedRoomGeometry[]): EditedRoomGeometry {
+  const result: EditedRoomGeometry = { roomId, grounds: [], paths: [], handles: [], radiusHandles: [], pillarAnchors: [], wallResizeHandles: [] };
+  const tagKinds = new Map<number, FootprintPath["kind"]>();
+  let nextTag = JUNCTION_TAG + 1;
+  const claimTag = (kind: FootprintPath["kind"]) => {
+    const tag = nextTag;
+    nextTag += 1;
+    tagKinds.set(tag, kind);
+    return tag;
+  };
+
+  const sourceEdges = geometries.flatMap((geometry) => geometry.paths.flatMap((path) =>
+    path.points.slice(1).map((end, index) => ({ start: path.points[index], end, kind: path.kind })),
+  ));
+  const kindForEdge = (start: PlanPoint, end: PlanPoint): FootprintPath["kind"] => {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const length = Math.hypot(dx, dy);
+    if (length < EPSILON) return "straight";
+    const midpoint = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
+    const match = sourceEdges.find((edge) => {
+      const ex = edge.end.x - edge.start.x;
+      const ey = edge.end.y - edge.start.y;
+      const edgeLength = Math.hypot(ex, ey);
+      if (edgeLength < EPSILON) return false;
+      const cross = Math.abs(ex * (midpoint.y - edge.start.y) - ey * (midpoint.x - edge.start.x));
+      const dot = (midpoint.x - edge.start.x) * ex + (midpoint.y - edge.start.y) * ey;
+      return cross < 1e-3 && dot > -1e-3 && dot < edgeLength * edgeLength + 1e-3;
+    });
+    return match?.kind ?? "straight";
+  };
+  const taggedRing = (points: PlanPoint[]) => points.map((point, index) => ({
+    x: point.x,
+    y: point.y,
+    tag: claimTag(kindForEdge(point, points[(index + 1) % points.length])),
+  }));
+  const polygons: TaggedPoint[][] = [];
+  for (const geometry of geometries) {
+    for (const ground of geometry.grounds) {
+      if (ground.outer.length >= 3) polygons.push(taggedRing(ground.outer));
+      for (const hole of ground.holes) if (hole.length >= 3) polygons.push(taggedRing(hole));
+    }
+  }
+  const rings = unionTagged(polygons);
+  const bare = (points: TaggedPoint[]) => points.map((point) => ({ x: point.x, y: point.y }));
+  const outerRings = rings.filter((ring) => ring.outer);
+  const holeRings = rings.filter((ring) => !ring.outer);
+  for (const ring of outerRings) {
+    result.grounds.push({
+      roomId,
+      outer: bare(ring.points),
+      holes: holeRings.filter((hole) => pointInPolygon(hole.points[0], ring.points)).map((hole) => bare(hole.points)),
+    });
+  }
+
+  for (const ring of rings) {
+    const runs = splitRuns(ring);
+    const ringOrientation = signedArea(bare(ring.points)) >= 0 ? 1 : -1;
+    for (const run of runs) {
+      const points = bare(run.points);
+      const kind = tagKinds.get(run.tag) ?? "straight";
+      result.paths.push({ points, kind });
+      if (kind !== "straight" || points.length < 2) continue;
+      const start = points[0];
+      const end = points[points.length - 1];
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+      const length = Math.hypot(dx, dy);
+      const axisAligned = Math.abs(dx) < EPSILON || Math.abs(dy) < EPSILON;
+      const collinear = points.every((point) => Math.abs(dx * (point.y - start.y) - dy * (point.x - start.x)) < EPSILON);
+      if (length >= EPSILON && axisAligned && collinear) {
+        result.wallResizeHandles.push({ roomId, start, end, outwardX: (dy / length) * ringOrientation, outwardY: (-dx / length) * ringOrientation });
+      }
+    }
+
+    // One pillar per meaningful exterior turn. Small tessellation turns along a curve do
+    // not qualify, while straight/diagonal corners and curve-to-wall joins do.
+    for (let index = 0; index < ring.points.length; index += 1) {
+      const previous = ring.points[(index - 1 + ring.points.length) % ring.points.length];
+      const current = ring.points[index];
+      const next = ring.points[(index + 1) % ring.points.length];
+      const ax = current.x - previous.x;
+      const ay = current.y - previous.y;
+      const bx = next.x - current.x;
+      const by = next.y - current.y;
+      const aLength = Math.hypot(ax, ay);
+      const bLength = Math.hypot(bx, by);
+      if (aLength < EPSILON || bLength < EPSILON) continue;
+      const turn = Math.acos(Math.max(-1, Math.min(1, (ax * bx + ay * by) / (aLength * bLength))));
+      const tagChanged = previous.tag !== current.tag || current.tag !== next.tag;
+      if (turn < 0.12 && !tagChanged) continue;
+      result.pillarAnchors.push({
+        point: { x: current.x, y: current.y },
+        inward: averageInward(previous, current, next),
+        junction: tagChanged,
+      });
+    }
+  }
+  return result;
 }
 
 const pointKey = (point: PlanPoint) => `${point.x},${point.y}`;
@@ -221,6 +329,10 @@ function buildOuterLoop(room: Room, gridLoop: PlanPoint[], curveQuality: number)
     const cross = (current.x - previous.x) * (next.y - current.y) - (current.y - previous.y) * (next.x - current.x);
     if (cross <= EPSILON) {
       replacements.push(null);
+      // An overlap between square rooms often creates a concave corner in the merged
+      // outline. It cannot use the convex corner editor, but it is still a wall junction
+      // and needs a pillar. Collinear points remain excluded from pillar generation.
+      if (cross < -EPSILON) pillarTargets.push({ x: current.x * CELL_SIZE, y: current.y * CELL_SIZE });
       continue;
     }
 
@@ -278,7 +390,18 @@ function buildOuterLoop(room: Room, gridLoop: PlanPoint[], curveQuality: number)
       inward: averageInward(points[(index - 1 + points.length) % points.length], points[index], points[(index + 1) % points.length]),
     };
   });
-  return { points, paths, handles, pillarAnchors };
+  // Straight portions remain resizable even when a different corner has been converted.
+  // Diagonal and curved paths are excluded by kind, so their authored shape stays intact.
+  const wallResizeHandles: WallResizeHandle[] = paths.flatMap((path) => {
+    if (path.kind !== "straight" || path.points.length !== 2) return [];
+    const [start, end] = path.points;
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const length = Math.hypot(dx, dy);
+    if (length < EPSILON || (Math.abs(dx) > EPSILON && Math.abs(dy) > EPSILON)) return [];
+    return [{ roomId: room.id, start, end, outwardX: dy / length, outwardY: -dx / length }];
+  });
+  return { points, paths, handles, pillarAnchors, wallResizeHandles };
 }
 
 /**
@@ -367,7 +490,7 @@ export function buildEditedRoomGeometry(room: Room, curveQuality = 64): EditedRo
   const loops = traceCellBoundaryLoops(room.cells);
   const outerLoops = loops.filter((loop) => signedArea(loop) > 0);
   const holeLoops = loops.filter((loop) => signedArea(loop) < 0);
-  const result: EditedRoomGeometry = { roomId: room.id, grounds: [], paths: [], handles: [], radiusHandles: [], pillarAnchors: [] };
+  const result: EditedRoomGeometry = { roomId: room.id, grounds: [], paths: [], handles: [], radiusHandles: [], pillarAnchors: [], wallResizeHandles: [] };
 
   // Keep the original index: `resizeCircle` addresses circles by their position in room.circles.
   const circleParts = (room.circles ?? [])
@@ -395,6 +518,7 @@ export function buildEditedRoomGeometry(room: Room, curveQuality = 64): EditedRo
       result.paths.push(...built.paths);
       result.handles.push(...built.handles);
       result.pillarAnchors.push(...built.pillarAnchors);
+      result.wallResizeHandles.push(...built.wallResizeHandles);
       result.grounds.push({
         roomId: room.id,
         outer: built.points,
@@ -490,8 +614,27 @@ export function buildEditedRoomGeometry(room: Room, curveQuality = 64): EditedRo
 
   for (const ring of rings) {
     const runs = splitRuns(ring);
+    const ringOrientation = signedArea(bare(ring.points)) >= 0 ? 1 : -1;
     for (const run of runs) {
-      result.paths.push({ points: bare(run.points), kind: tagKinds.get(run.tag) ?? "straight" });
+      const runPoints = bare(run.points);
+      const kind = tagKinds.get(run.tag) ?? "straight";
+      result.paths.push({ points: runPoints, kind });
+      if (kind !== "straight" || runPoints.length < 2) continue;
+      const start = runPoints[0];
+      const end = runPoints[runPoints.length - 1];
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+      const length = Math.hypot(dx, dy);
+      const axisAligned = Math.abs(dx) < EPSILON || Math.abs(dy) < EPSILON;
+      const collinear = runPoints.every((point) => Math.abs(dx * (point.y - start.y) - dy * (point.x - start.x)) < EPSILON);
+      if (length < EPSILON || !axisAligned || !collinear) continue;
+      result.wallResizeHandles.push({
+        roomId: room.id,
+        start,
+        end,
+        outwardX: (dy / length) * ringOrientation,
+        outwardY: (-dx / length) * ringOrientation,
+      });
     }
 
     // A curved room part meeting a rectilinear part needs a structural/visual terminator.

@@ -32,6 +32,13 @@ export interface BuildSettings {
   pillarInset: number;
   curveQuality: number;
   sharedWallSeparation: number;
+  dynamicLighting: boolean;
+  timeOfDay: number;
+  ambientLight: number;
+  exposure: number;
+  hdriBackground: boolean;
+  hdriIntensity: number;
+  hdriRotation: number;
 }
 
 export type Side = "S" | "E" | "N" | "W";
@@ -92,6 +99,15 @@ export interface RadiusHandle {
   angle: number;
 }
 
+export interface WallResizeHandle {
+  roomId: string;
+  start: PlanPoint;
+  end: PlanPoint;
+  /** Unit vector pointing away from the room footprint. */
+  outwardX: number;
+  outwardY: number;
+}
+
 export interface LayoutBounds { minX: number; minY: number; maxX: number; maxY: number; }
 
 export interface LayoutStats {
@@ -113,9 +129,15 @@ export interface GeneratedLayout {
   wallPaths: WallPath[];
   corners: Corner[];
   pillars: Pillar[];
+  /** Unioned shapes used to render floors for overlapping rooms. */
   roomGrounds: RoomGround[];
+  /** Original per-room shapes retained for raycast selection while rooms overlap. */
+  roomHitAreas: RoomGround[];
+  /** Logical room IDs represented by each temporary visual union. */
+  roomGroups: string[][];
   cornerHandles: CornerHandle[];
   radiusHandles: RadiusHandle[];
+  wallResizeHandles: WallResizeHandle[];
   bounds: LayoutBounds;
   stats: LayoutStats;
 }

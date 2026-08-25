@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "./icons";
-import { buildLayout, MAX_CELLS, normalizeCells, rectangleCells } from "./layout";
+import { buildLayout, CELL_SIZE, MAX_CELLS, normalizeCells, rectangleCells, resizeRoomCells } from "./layout";
 import { circleIntersectsCellBounds, circleOverlapsCells, circlesOverlap, MIN_CIRCLE_RADIUS } from "./footprint";
 import type {
   BuildSettings,
@@ -12,11 +12,19 @@ import type {
   Room,
   SavedProject,
   Variant,
+  WallResizeHandle,
 } from "./types";
 
 const STORAGE_KEY = "mor-room-planner:project:v3";
 const LEGACY_STORAGE_KEYS = ["mor-room-planner:project:v2", "mor-room-planner:project:v1"];
 const HISTORY_LIMIT = 60;
+// Wall transforms are part of the module assembly contract. Keeping them fixed prevents a
+// saved project or an accidental slider change from turning the two authored faces away
+// from the room or pulling them off its boundary.
+const LOCKED_INNER_WALL_FLIP = true;
+const LOCKED_OUTER_WALL_FLIP = false;
+const LOCKED_INNER_WALL_OFFSET = 0.15;
+const LOCKED_OUTER_WALL_OFFSET = 0.25;
 const ThreeViewport = lazy(async () => {
   const module = await import("./components/ThreeViewport");
   return { default: module.ThreeViewport };
@@ -27,13 +35,13 @@ const DEFAULT_SETTINGS: BuildSettings = {
   wallVariant: "A",
   innerWallVariant: "A",
   outerWallVariant: "A",
-  flipInnerWall: true,
-  flipOuterWall: true,
+  flipInnerWall: LOCKED_INNER_WALL_FLIP,
+  flipOuterWall: LOCKED_OUTER_WALL_FLIP,
   wallOrientationVersion: 1,
   showInnerWalls: true,
   showOuterWalls: true,
-  innerWallOffset: 0,
-  outerWallOffset: 0,
+  innerWallOffset: LOCKED_INNER_WALL_OFFSET,
+  outerWallOffset: LOCKED_OUTER_WALL_OFFSET,
   cornerVariant: "A",
   pillarVariant: "A",
   randomizeWalls: true,
@@ -42,6 +50,13 @@ const DEFAULT_SETTINGS: BuildSettings = {
   pillarInset: 0.3,
   curveQuality: 64,
   sharedWallSeparation: 0.04,
+  dynamicLighting: true,
+  timeOfDay: 13,
+  ambientLight: 1,
+  exposure: 1.05,
+  hdriBackground: true,
+  hdriIntensity: 1,
+  hdriRotation: 0,
 };
 
 const EXAMPLE_CELLS = normalizeCells([
@@ -68,19 +83,18 @@ function isVariant(value: unknown): value is Variant {
 function sanitizeSettings(value: unknown): BuildSettings {
   if (!value || typeof value !== "object") return DEFAULT_SETTINGS;
   const input = value as Partial<BuildSettings>;
-  const orientationMigrated = input.wallOrientationVersion === 1;
   return {
     floorVariant: isVariant(input.floorVariant) ? input.floorVariant : DEFAULT_SETTINGS.floorVariant,
     wallVariant: isVariant(input.wallVariant) ? input.wallVariant : DEFAULT_SETTINGS.wallVariant,
     innerWallVariant: isVariant(input.innerWallVariant) ? input.innerWallVariant : DEFAULT_SETTINGS.innerWallVariant,
     outerWallVariant: isVariant(input.outerWallVariant) ? input.outerWallVariant : DEFAULT_SETTINGS.outerWallVariant,
-    flipInnerWall: orientationMigrated && typeof input.flipInnerWall === "boolean" ? input.flipInnerWall : true,
-    flipOuterWall: orientationMigrated && typeof input.flipOuterWall === "boolean" ? input.flipOuterWall : true,
+    flipInnerWall: LOCKED_INNER_WALL_FLIP,
+    flipOuterWall: LOCKED_OUTER_WALL_FLIP,
     wallOrientationVersion: 1,
     showInnerWalls: typeof input.showInnerWalls === "boolean" ? input.showInnerWalls : DEFAULT_SETTINGS.showInnerWalls,
     showOuterWalls: typeof input.showOuterWalls === "boolean" ? input.showOuterWalls : DEFAULT_SETTINGS.showOuterWalls,
-    innerWallOffset: Number.isFinite(input.innerWallOffset) ? Math.min(1, Math.max(-1, Number(input.innerWallOffset))) : DEFAULT_SETTINGS.innerWallOffset,
-    outerWallOffset: Number.isFinite(input.outerWallOffset) ? Math.min(1, Math.max(-1, Number(input.outerWallOffset))) : DEFAULT_SETTINGS.outerWallOffset,
+    innerWallOffset: LOCKED_INNER_WALL_OFFSET,
+    outerWallOffset: LOCKED_OUTER_WALL_OFFSET,
     cornerVariant: isVariant(input.cornerVariant) ? input.cornerVariant : DEFAULT_SETTINGS.cornerVariant,
     pillarVariant: isVariant(input.pillarVariant) ? input.pillarVariant : DEFAULT_SETTINGS.pillarVariant,
     randomizeWalls: typeof input.randomizeWalls === "boolean" ? input.randomizeWalls : DEFAULT_SETTINGS.randomizeWalls,
@@ -89,6 +103,13 @@ function sanitizeSettings(value: unknown): BuildSettings {
     pillarInset: Number.isFinite(input.pillarInset) ? Math.min(2, Math.max(0, Number(input.pillarInset))) : DEFAULT_SETTINGS.pillarInset,
     curveQuality: Number.isFinite(input.curveQuality) ? Math.min(128, Math.max(64, Math.trunc(Number(input.curveQuality)))) : DEFAULT_SETTINGS.curveQuality,
     sharedWallSeparation: Number.isFinite(input.sharedWallSeparation) ? Math.min(0.25, Math.max(0, Number(input.sharedWallSeparation))) : DEFAULT_SETTINGS.sharedWallSeparation,
+    dynamicLighting: typeof input.dynamicLighting === "boolean" ? input.dynamicLighting : DEFAULT_SETTINGS.dynamicLighting,
+    timeOfDay: Number.isFinite(input.timeOfDay) ? Math.min(24, Math.max(0, Number(input.timeOfDay))) : DEFAULT_SETTINGS.timeOfDay,
+    ambientLight: Number.isFinite(input.ambientLight) ? Math.min(2.5, Math.max(0.1, Number(input.ambientLight))) : DEFAULT_SETTINGS.ambientLight,
+    exposure: Number.isFinite(input.exposure) ? Math.min(1.6, Math.max(0.5, Number(input.exposure))) : DEFAULT_SETTINGS.exposure,
+    hdriBackground: typeof input.hdriBackground === "boolean" ? input.hdriBackground : DEFAULT_SETTINGS.hdriBackground,
+    hdriIntensity: Number.isFinite(input.hdriIntensity) ? Math.min(3, Math.max(0, Number(input.hdriIntensity))) : DEFAULT_SETTINGS.hdriIntensity,
+    hdriRotation: Number.isFinite(input.hdriRotation) ? Math.min(360, Math.max(0, Number(input.hdriRotation))) : DEFAULT_SETTINGS.hdriRotation,
   };
 }
 
@@ -239,6 +260,13 @@ function formatNumber(value: number) {
   return new Intl.NumberFormat("en", { maximumFractionDigits: 1 }).format(value);
 }
 
+function formatTimeOfDay(value: number) {
+  const minutes = Math.round(value * 60) % (24 * 60);
+  const hour = Math.floor(minutes / 60);
+  const minute = minutes % 60;
+  return `${hour.toString().padStart(2, "0")}:${minute.toString().padStart(2, "0")}`;
+}
+
 function SelectField({
   label,
   value,
@@ -289,7 +317,13 @@ export default function App() {
   const cellsRef = useRef(cells);
   const roomsRef = useRef(rooms);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const hdriInputRef = useRef<HTMLInputElement>(null);
+  const cubeMapInputRef = useRef<HTMLInputElement>(null);
   const toastTimeoutRef = useRef<number | null>(null);
+  const [hdriUrl, setHdriUrl] = useState<string | null>(null);
+  const [hdriName, setHdriName] = useState<string | null>(null);
+  const [hdriKind, setHdriKind] = useState<"hdr" | "exr" | null>(null);
+  const [cubeMapUrls, setCubeMapUrls] = useState<[string, string, string, string, string, string] | null>(null);
   const layout = useMemo(() => buildLayout(cells, settings, rooms), [cells, settings, rooms]);
   cellsRef.current = cells;
   roomsRef.current = rooms;
@@ -299,6 +333,13 @@ export default function App() {
     setToast({ id: Date.now(), message });
     toastTimeoutRef.current = window.setTimeout(() => setToast(null), 3200);
   }, []);
+
+  useEffect(() => () => {
+    if (hdriUrl) URL.revokeObjectURL(hdriUrl);
+  }, [hdriUrl]);
+  useEffect(() => () => {
+    cubeMapUrls?.forEach((url) => URL.revokeObjectURL(url));
+  }, [cubeMapUrls]);
 
   /** Room-only changes (corner edits, circle resize) deliberately do not touch history. */
   const updateRooms = useCallback((updater: (current: Room[]) => Room[]) => {
@@ -383,6 +424,58 @@ export default function App() {
       ? { ...room, circles: room.circles.map((circle, index) => index === circleIndex ? { ...circle, radius: snapped } : circle) }
       : room));
   }, [updateRooms]);
+
+  const moveRoom = useCallback((roomId: string, dxCells: number, dyCells: number) => {
+    const dx = Math.trunc(dxCells);
+    const dy = Math.trunc(dyCells);
+    if (!dx && !dy) return;
+    const moved = roomsRef.current.find((room) => room.id === roomId);
+    if (!moved) return;
+    const movedRoom: Room = {
+      ...moved,
+      cells: moved.cells.map((cell) => ({ x: cell.x + dx, y: cell.y + dy })),
+      circles: moved.circles.map((circle) => ({ ...circle, cx: circle.cx + dx * CELL_SIZE, cy: circle.cy + dy * CELL_SIZE })),
+      cornerEdits: moved.cornerEdits.map((edit) => ({ ...edit, vertexX: edit.vertexX + dx, vertexY: edit.vertexY + dy })),
+    };
+    // Keep the moved room first. During a temporary overlap it becomes the selectable
+    // visual union owner, but every original room record remains intact for separation.
+    const nextRooms = [movedRoom, ...roomsRef.current.filter((room) => room.id !== roomId)];
+    const nextCells = normalizeCells(nextRooms.flatMap((room) => room.cells));
+    if (nextCells.length > MAX_CELLS) {
+      notify(`Plans are limited to ${MAX_CELLS.toLocaleString()} cells for browser performance.`);
+      return;
+    }
+    commitPlan(nextCells, nextRooms);
+  }, [commitPlan, notify]);
+
+  const resizeRoomWall = useCallback((updates: Array<{ handle: WallResizeHandle; steps: number }>) => {
+    const changesByRoom = new Map<string, Array<{ handle: WallResizeHandle; steps: number }>>();
+    for (const update of updates) {
+      if (!update.steps) continue;
+      const changes = changesByRoom.get(update.handle.roomId) ?? [];
+      changes.push(update);
+      changesByRoom.set(update.handle.roomId, changes);
+    }
+    if (!changesByRoom.size) return;
+    const nextRooms = roomsRef.current.map((room) => {
+      const changes = changesByRoom.get(room.id);
+      if (!changes) return room;
+      const resized = changes.reduce((roomCells, change) => resizeRoomCells(roomCells, change.handle, change.steps), room.cells);
+      if (!resized.length && !room.circles.length) return null;
+      return { ...room, cells: resized, cornerEdits: [] };
+    });
+    if (nextRooms.some((room) => room === null)) {
+      notify("A shared wall cannot be moved past the opposite side of a room.");
+      return;
+    }
+    const resolvedRooms = nextRooms as Room[];
+    const nextCells = normalizeCells(resolvedRooms.flatMap((candidate) => candidate.cells));
+    if (nextCells.length > MAX_CELLS) {
+      notify(`Plans are limited to ${MAX_CELLS.toLocaleString()} cells for browser performance.`);
+      return;
+    }
+    commitPlan(nextCells, resolvedRooms);
+  }, [commitPlan, notify]);
 
   const undo = useCallback(() => {
     const previous = undoStack.current.pop();
@@ -606,7 +699,7 @@ export default function App() {
               <button type="button" className={tool === "erase" ? "active" : ""} onClick={() => setTool("erase")}><Icon name="erase" /><span>Erase</span><kbd>E</kbd></button>
               <button type="button" className={tool === "select" ? "active" : ""} onClick={() => setTool("select")}><Icon name="grid" /><span>Select</span><kbd>S</kbd></button>
             </div>
-            <p className="control-help">Draw or erase with left drag. Circle drags stay square, so the inscribed room snaps to whole-metre radii (minimum {MIN_CIRCLE_RADIUS} m). Select a room to edit its corners or drag a circle's radius. Middle mouse pans, right mouse orbits, and the wheel zooms.</p>
+            <p className="control-help">Draw or erase with left drag. In Select mode, drag a room floor to move the whole room or drag a blue wall grip to resize it. Circle drags stay square, so the inscribed room snaps to whole-metre radii (minimum {MIN_CIRCLE_RADIUS} m). Middle mouse pans, right mouse orbits, and the wheel zooms.</p>
             <div className="history-row">
               <button type="button" onClick={undo} disabled={!undoStack.current.length}><Icon name="undo" />Undo</button>
               <button type="button" onClick={redo} disabled={!redoStack.current.length}><Icon name="redo" />Redo</button>
@@ -615,10 +708,11 @@ export default function App() {
 
           <section className="control-section corner-editor">
             <div className="section-heading"><span>02</span><h2>Room corner editor</h2></div>
-            {!selectedRoom && <p className="control-help">Choose Select, then click a room to display its editable convex corners.</p>}
+            {!selectedRoom && <p className="control-help">Choose Select, then click a room to display its move, wall-resize, corner, or radius handles.</p>}
             {selectedRoom && (
               <>
                 <div className="selected-room-label"><span>Selected room</span><b>{selectedRoom.id.replace(/^room-/, "")}</b></div>
+                <p className="control-help">Drag the floor to move this room in 2 m steps. Drag a blue edge grip perpendicular to its wall to add or remove floor rows.</p>
                 <SelectField label="Room inside wall" value={selectedRoom.style.innerWallVariant} options={variantOptions} onChange={(value) => updateSelectedRoomStyle("inner", value)} />
                 <SelectField label="Room outside wall" value={selectedRoom.style.outerWallVariant} options={variantOptions} onChange={(value) => updateSelectedRoomStyle("outer", value)} />
                 <div className="corner-actions">
@@ -655,12 +749,12 @@ export default function App() {
             <SelectField label="Ground" value={settings.floorVariant} options={variantOptions} onChange={(value) => updateSetting("floorVariant", value)} />
             <SelectField label="Inside wall" value={settings.innerWallVariant} options={variantOptions} onChange={(value) => updateSetting("innerWallVariant", value)} />
             <Switch label="Inside walls" checked={settings.showInnerWalls} onChange={(value) => updateSetting("showInnerWalls", value)} />
-            <Switch label="Rotate inside wall 180°" checked={settings.flipInnerWall} onChange={(value) => updateSetting("flipInnerWall", value)} />
-            <label className="range-field"><span><b>Inside offset</b><output>{settings.innerWallOffset.toFixed(2)} m</output></span><input type="range" min="-1" max="1" step="0.05" value={settings.innerWallOffset} onChange={(event) => updateSetting("innerWallOffset", Number(event.target.value))} /></label>
             <SelectField label="Outside wall" value={settings.outerWallVariant} options={variantOptions} onChange={(value) => updateSetting("outerWallVariant", value)} />
             <Switch label="Outside walls" checked={settings.showOuterWalls} onChange={(value) => updateSetting("showOuterWalls", value)} />
-            <Switch label="Rotate outside wall 180°" checked={settings.flipOuterWall} onChange={(value) => updateSetting("flipOuterWall", value)} />
-            <label className="range-field"><span><b>Outside offset</b><output>{settings.outerWallOffset.toFixed(2)} m</output></span><input type="range" min="-1" max="1" step="0.05" value={settings.outerWallOffset} onChange={(event) => updateSetting("outerWallOffset", Number(event.target.value))} /></label>
+            <div className="fixed-specs wall-transform-locks" aria-label="Locked wall transforms">
+              <span><i>Inside locked</i><b>180° · {settings.innerWallOffset.toFixed(2)} m</b></span>
+              <span><i>Outside locked</i><b>0° · {settings.outerWallOffset.toFixed(2)} m</b></span>
+            </div>
             <Switch label="Shuffle wall variants" checked={settings.randomizeWalls} onChange={(value) => updateSetting("randomizeWalls", value)} />
             {settings.randomizeWalls && (
               <label className="seed-row">
@@ -699,8 +793,95 @@ export default function App() {
             </div>
           </section>
 
+          <section className="control-section lighting-system">
+            <div className="section-heading"><span>05</span><h2>Dynamic lighting</h2></div>
+            <Switch label="Sun and sky" checked={settings.dynamicLighting} onChange={(value) => updateSetting("dynamicLighting", value)} />
+            <label className="range-field">
+              <span><b>Time of day</b><output>{formatTimeOfDay(settings.timeOfDay)}</output></span>
+              <input type="range" min="0" max="24" step="0.25" value={settings.timeOfDay} onChange={(event) => updateSetting("timeOfDay", Number(event.target.value))} />
+            </label>
+            <div className="lighting-presets" aria-label="Time of day presets">
+              {([['Dawn', 6.5], ['Noon', 12], ['Sunset', 18], ['Night', 22]] as const).map(([label, hour]) => (
+                <button type="button" key={label} onClick={() => updateSetting("timeOfDay", hour)}>{label}</button>
+              ))}
+            </div>
+            <label className="range-field">
+              <span><b>Ambient light</b><output>{settings.ambientLight.toFixed(2)}</output></span>
+              <input type="range" min="0.1" max="2.5" step="0.05" value={settings.ambientLight} onChange={(event) => updateSetting("ambientLight", Number(event.target.value))} />
+            </label>
+            <label className="range-field">
+              <span><b>Exposure</b><output>{settings.exposure.toFixed(2)}</output></span>
+              <input type="range" min="0.5" max="1.6" step="0.05" value={settings.exposure} onChange={(event) => updateSetting("exposure", Number(event.target.value))} />
+            </label>
+            <div className="hdri-upload-row">
+              <button type="button" onClick={() => hdriInputRef.current?.click()}>{hdriUrl ? 'Replace HDR/EXR' : 'Load HDR/EXR'}</button>
+              <span title={hdriName ?? undefined}>{hdriName ?? 'Single environment file'}</span>
+              <input
+                ref={hdriInputRef}
+                className="visually-hidden"
+                type="file"
+                accept=".hdr,.exr,image/vnd.radiance"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) {
+                    const kind = file.name.toLowerCase().endsWith('.exr') ? 'exr' : 'hdr';
+                    setHdriUrl(URL.createObjectURL(file));
+                    setHdriName(file.name);
+                    setHdriKind(kind);
+                    setCubeMapUrls(null);
+                    notify(`${kind.toUpperCase()} environment loaded: ${file.name}`);
+                  }
+                  event.target.value = '';
+                }}
+              />
+            </div>
+            <div className="hdri-upload-row">
+              <button type="button" onClick={() => cubeMapInputRef.current?.click()}>{cubeMapUrls ? 'Replace skybox' : 'Load 6-face skybox'}</button>
+              <span>{cubeMapUrls ? 'px · nx · py · ny · pz · nz' : 'Select all six PNG/JPG faces'}</span>
+              <input
+                ref={cubeMapInputRef}
+                className="visually-hidden"
+                type="file"
+                accept=".png,.jpg,.jpeg,image/png,image/jpeg"
+                multiple
+                onChange={(event) => {
+                  const files = [...(event.target.files ?? [])];
+                  const axes = ['px', 'nx', 'py', 'ny', 'pz', 'nz'] as const;
+                  const byAxis = axes.map((axis) => files.find((file) => {
+                    const base = file.name.toLowerCase().replace(/\.[^.]+$/, '');
+                    return base === axis || new RegExp(`(^|[_-])${axis}($|[_-])`).test(base);
+                  }));
+                  if (byAxis.some((file) => !file)) {
+                    notify('Select six images named px, nx, py, ny, pz and nz.');
+                  } else {
+                    setCubeMapUrls(byAxis.map((file) => URL.createObjectURL(file!)) as [string, string, string, string, string, string]);
+                    setHdriUrl(null);
+                    setHdriName(null);
+                    setHdriKind(null);
+                    notify('Six-face skybox loaded.');
+                  }
+                  event.target.value = '';
+                }}
+              />
+            </div>
+            {(hdriUrl || cubeMapUrls) && (
+              <>
+                <button type="button" className="environment-clear" onClick={() => { setHdriUrl(null); setHdriName(null); setHdriKind(null); setCubeMapUrls(null); }}>Clear environment</button>
+                <Switch label="Show environment background" checked={settings.hdriBackground} onChange={(value) => updateSetting("hdriBackground", value)} />
+                <label className="range-field">
+                  <span><b>HDRI strength</b><output>{settings.hdriIntensity.toFixed(2)}</output></span>
+                  <input type="range" min="0" max="3" step="0.05" value={settings.hdriIntensity} onChange={(event) => updateSetting("hdriIntensity", Number(event.target.value))} />
+                </label>
+                <label className="range-field">
+                  <span><b>HDRI rotation</b><output>{Math.round(settings.hdriRotation)}°</output></span>
+                  <input type="range" min="0" max="360" step="1" value={settings.hdriRotation} onChange={(event) => updateSetting("hdriRotation", Number(event.target.value))} />
+                </label>
+              </>
+            )}
+          </section>
+
           <section className="control-section asset-library">
-            <div className="section-heading"><span>05</span><h2>Asset library</h2></div>
+            <div className="section-heading"><span>06</span><h2>Asset library</h2></div>
             <div className="asset-grid">
               {([
                 { label: "Ground", file: "FL2x2A.webp", variant: null, grounds: true },
@@ -745,6 +926,9 @@ export default function App() {
                 <ThreeViewport
                   layout={layout}
                   settings={settings}
+                  hdriUrl={hdriUrl}
+                  hdriKind={hdriKind}
+                  cubeMapUrls={cubeMapUrls}
                   fitSignal={fitSignal}
                   tool={tool}
                   selectedRoomId={selectedRoomId}
@@ -755,6 +939,8 @@ export default function App() {
                   onCornerEdit={updateCornerEdit}
                   onCornerRemove={removeCornerEdit}
                   onCircleResize={resizeCircle}
+                  onRoomMove={moveRoom}
+                  onWallResize={resizeRoomWall}
                   onNotice={notify}
                 />
               </Suspense>

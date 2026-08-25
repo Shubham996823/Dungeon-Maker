@@ -2,6 +2,8 @@ import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { RGBELoader } from "three/addons/loaders/RGBELoader.js";
+import { EXRLoader } from "three/addons/loaders/EXRLoader.js";
 import { CELL_SIZE, MAX_CELLS, WALL_HEIGHT, WALL_THICKNESS } from "../layout";
 import { circleFromDrag, MIN_CIRCLE_RADIUS, pointInPolygon } from "../footprint";
 import { cellCenterToWorld, planYToWorldZ, worldPointToCell } from "../coordinates";
@@ -18,6 +20,7 @@ import type {
   RadiusHandle,
   Variant,
   WallPath,
+  WallResizeHandle,
   WallSegment,
 } from "../types";
 import { Icon } from "../icons";
@@ -27,6 +30,9 @@ interface CornerIdentity { roomId: string; vertexX: number; vertexY: number; }
 interface ThreeViewportProps {
   layout: GeneratedLayout;
   settings: BuildSettings;
+  hdriUrl: string | null;
+  hdriKind: "hdr" | "exr" | null;
+  cubeMapUrls: [string, string, string, string, string, string] | null;
   fitSignal: number;
   tool: EditorTool;
   selectedRoomId: string | null;
@@ -37,6 +43,8 @@ interface ThreeViewportProps {
   onCornerEdit: (roomId: string, edit: CornerEdit) => void;
   onCornerRemove: (roomId: string, vertexX: number, vertexY: number) => void;
   onCircleResize: (roomId: string, circleIndex: number, radius: number) => void;
+  onRoomMove: (roomId: string, dxCells: number, dyCells: number) => void;
+  onWallResize: (updates: Array<{ handle: WallResizeHandle; steps: number }>) => void;
   onNotice: (message: string) => void;
 }
 
@@ -45,6 +53,11 @@ interface SceneRuntime {
   camera: THREE.PerspectiveCamera;
   renderer: THREE.WebGLRenderer;
   controls: OrbitControls;
+  hemisphere: THREE.HemisphereLight;
+  sun: THREE.DirectionalLight;
+  hdriBackgroundMap: THREE.Texture | null;
+  hdriEnvironmentMap: THREE.Texture | null;
+  hdriLoadVersion: number;
   generated: THREE.Group;
   handles: THREE.Group;
   assets: {
@@ -60,6 +73,7 @@ interface SceneRuntime {
     trim: THREE.MeshStandardMaterial;
     handle: THREE.MeshBasicMaterial;
     handleActive: THREE.MeshBasicMaterial;
+    wallHandle: THREE.MeshBasicMaterial;
   };
   render: () => void;
   setTool: (tool: EditorTool) => void;
@@ -94,6 +108,74 @@ interface RadiusDragState {
   handle: RadiusHandle;
   original: number;
   current: number;
+}
+
+interface RoomMoveDragState {
+  pointerId: number;
+  roomId: string;
+  start: Cell;
+  dxCells: number;
+  dyCells: number;
+}
+
+interface WallResizeDragState {
+  pointerId: number;
+  handles: WallResizeHandle[];
+  start: PlanPoint;
+  steps: number;
+}
+
+interface MergedWallResizeControl {
+  /** One or more room-owned handles that occupy the exact same shared wall. */
+  handles: WallResizeHandle[];
+}
+
+function pointKey(point: PlanPoint) {
+  return `${point.x.toFixed(4)},${point.y.toFixed(4)}`;
+}
+
+/** Direction-independent key, so the two faces of a shared wall collapse into one control. */
+function wallHandleKey(handle: WallResizeHandle) {
+  const start = pointKey(handle.start);
+  const end = pointKey(handle.end);
+  return start < end ? `${start}|${end}` : `${end}|${start}`;
+}
+
+function joinedRoomIds(layout: GeneratedLayout, selectedRoomId: string) {
+  const roomsByWall = new Map<string, Set<string>>();
+  for (const handle of layout.wallResizeHandles) {
+    const roomIds = roomsByWall.get(wallHandleKey(handle)) ?? new Set<string>();
+    roomIds.add(handle.roomId);
+    roomsByWall.set(wallHandleKey(handle), roomIds);
+  }
+  const joined = new Set([selectedRoomId]);
+  const visualGroup = layout.roomGroups.find((roomIds) => roomIds.includes(selectedRoomId));
+  visualGroup?.forEach((roomId) => joined.add(roomId));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const roomIds of roomsByWall.values()) {
+      if (![...roomIds].some((roomId) => joined.has(roomId))) continue;
+      for (const roomId of roomIds) {
+        if (!joined.has(roomId)) {
+          joined.add(roomId);
+          changed = true;
+        }
+      }
+    }
+  }
+  return joined;
+}
+
+function mergeWallResizeControls(handles: WallResizeHandle[]) {
+  const controls = new Map<string, MergedWallResizeControl>();
+  for (const handle of handles) {
+    const key = wallHandleKey(handle);
+    const control = controls.get(key) ?? { handles: [] };
+    control.handles.push(handle);
+    controls.set(key, control);
+  }
+  return [...controls.values()];
 }
 
 /** The drag is bounding-box, but locked square, so the inscribed circle is the room. */
@@ -341,6 +423,83 @@ function renderPathWall(runtime: SceneRuntime, wall: WallPath, settings: BuildSe
   if (settings.showOuterWalls) addDeformedWall(runtime, runtime.assets.walls[wall.outsideVariant], wall.points, settings.flipOuterWall, -settings.outerWallOffset);
 }
 
+function updateDynamicLighting(runtime: SceneRuntime, layout: GeneratedLayout, settings: BuildSettings) {
+  const { scene, renderer, hemisphere, sun } = runtime;
+  renderer.toneMappingExposure = settings.exposure;
+
+  const centerX = (layout.bounds.minX + layout.bounds.maxX) / 2;
+  const centerY = (layout.bounds.minY + layout.bounds.maxY) / 2;
+  const centerZ = planYToWorldZ(centerY);
+  const span = Math.max(layout.bounds.maxX - layout.bounds.minX, layout.bounds.maxY - layout.bounds.minY, 20);
+  const shadowSpan = Math.max(45, span * 0.72 + 12);
+  sun.shadow.camera.left = -shadowSpan;
+  sun.shadow.camera.right = shadowSpan;
+  sun.shadow.camera.top = shadowSpan;
+  sun.shadow.camera.bottom = -shadowSpan;
+  sun.shadow.camera.near = 0.5;
+  sun.shadow.camera.far = Math.max(350, span * 8);
+  sun.shadow.camera.updateProjectionMatrix();
+  sun.target.position.set(centerX, 0, centerZ);
+  sun.target.updateMatrixWorld();
+
+  const applyHdri = () => {
+    scene.environment = runtime.hdriEnvironmentMap;
+    scene.environmentIntensity = settings.hdriIntensity;
+    const rotation = THREE.MathUtils.degToRad(settings.hdriRotation);
+    scene.environmentRotation.set(0, rotation, 0);
+    scene.backgroundRotation.set(0, rotation, 0);
+    if (settings.hdriBackground && runtime.hdriBackgroundMap) scene.background = runtime.hdriBackgroundMap;
+  };
+
+  if (!settings.dynamicLighting) {
+    scene.background = new THREE.Color(0x131715);
+    if (scene.fog instanceof THREE.Fog) scene.fog.color.set(0x131715);
+    hemisphere.color.set(0xf2eee4);
+    hemisphere.groundColor.set(0x1a211d);
+    hemisphere.intensity = 2.25 * settings.ambientLight;
+    sun.color.set(0xfff3dc);
+    sun.intensity = 3.2;
+    sun.position.set(centerX + span * 0.9, span * 1.4, centerZ + span * 0.7);
+    applyHdri();
+    return;
+  }
+
+  const hour = ((settings.timeOfDay % 24) + 24) % 24;
+  const solarAngle = ((hour - 6) / 24) * Math.PI * 2;
+  const elevation = Math.sin(solarAngle);
+  const daylight = THREE.MathUtils.smoothstep(elevation, -0.14, 0.34);
+  const horizonGlow = 1 - THREE.MathUtils.smoothstep(Math.abs(elevation), 0.03, 0.42);
+  const azimuth = solarAngle + Math.PI * 0.18;
+  const orbitRadius = Math.max(70, span * 2.4);
+  const lightElevation = elevation >= -0.08 ? Math.max(0.08, elevation) : Math.max(0.12, -elevation);
+  const horizontalDirection = elevation >= -0.08 ? 1 : -1;
+  sun.position.set(
+    centerX + Math.cos(azimuth) * orbitRadius * horizontalDirection,
+    lightElevation * orbitRadius,
+    centerZ + Math.sin(azimuth) * orbitRadius * horizontalDirection,
+  );
+
+  const nightSky = new THREE.Color(0x070d18);
+  const daySky = new THREE.Color(0x7893a4);
+  const twilightSky = new THREE.Color(0x8b5046);
+  const sky = nightSky.clone().lerp(daySky, daylight).lerp(twilightSky, horizonGlow * 0.58);
+  scene.background = sky;
+  if (scene.fog instanceof THREE.Fog) scene.fog.color.copy(sky);
+
+  const warmSun = new THREE.Color(0xff8a5a);
+  const highSun = new THREE.Color(0xfff2d6);
+  const moon = new THREE.Color(0x91aee0);
+  sun.color.copy(elevation >= -0.08
+    ? warmSun.clone().lerp(highSun, THREE.MathUtils.smoothstep(elevation, 0.05, 0.75))
+    : moon);
+  sun.intensity = elevation >= -0.08 ? 0.35 + daylight * 3.4 : 0.55;
+
+  hemisphere.color.copy(new THREE.Color(0x91a7bc).lerp(new THREE.Color(0xe9edf0), daylight));
+  hemisphere.groundColor.copy(new THREE.Color(0x101722).lerp(new THREE.Color(0x31372f), daylight));
+  hemisphere.intensity = settings.ambientLight * (0.38 + daylight * 1.55);
+  applyHdri();
+}
+
 function rebuildScene(runtime: SceneRuntime, layout: GeneratedLayout, settings: BuildSettings, selectedRoomId: string | null, activeCorner: CornerIdentity | null) {
   disposeGenerated(runtime.generated);
   runtime.handles.clear();
@@ -373,17 +532,31 @@ function rebuildScene(runtime: SceneRuntime, layout: GeneratedLayout, settings: 
   }
 
   if (selectedRoomId) {
-    for (const handle of layout.cornerHandles.filter((candidate) => candidate.roomId === selectedRoomId)) {
+    // Selecting one room exposes the connected assembly. Shared room boundaries and
+    // vertices collapse to a single control instead of drawing controls on top of each other.
+    const visibleRoomIds = joinedRoomIds(layout, selectedRoomId);
+    const visibleCorners = layout.cornerHandles.filter((candidate) => visibleRoomIds.has(candidate.roomId));
+    const mergedCorners = new Map<string, CornerHandle[]>();
+    for (const handle of visibleCorners) {
+      const key = `${handle.vertexX},${handle.vertexY}`;
+      const cornerGroup = mergedCorners.get(key) ?? [];
+      cornerGroup.push(handle);
+      mergedCorners.set(key, cornerGroup);
+    }
+    for (const cornerGroup of mergedCorners.values()) {
+      // Prefer the currently selected room, so the corner editor always stays focused
+      // on the room the user originally clicked.
+      const handle = cornerGroup.find((candidate) => candidate.roomId === selectedRoomId) ?? cornerGroup[0];
       const active = activeCorner?.roomId === handle.roomId && activeCorner.vertexX === handle.vertexX && activeCorner.vertexY === handle.vertexY;
       const mesh = new THREE.Mesh(runtime.cube, active ? runtime.materials.handleActive : runtime.materials.handle);
-      mesh.position.set(handle.vertexX * CELL_SIZE, 0.52, planYToWorldZ(handle.vertexY * CELL_SIZE));
-      mesh.scale.setScalar(active ? 0.38 : 0.3);
+      mesh.position.set(handle.vertexX * CELL_SIZE, 0.7, planYToWorldZ(handle.vertexY * CELL_SIZE));
+      mesh.scale.setScalar(active ? 0.86 : 0.72);
       mesh.renderOrder = 30;
       mesh.userData.cornerHandle = handle;
       runtime.handles.add(mesh);
     }
     // Four grab points around the circumference; each resizes the radius identically.
-    for (const handle of layout.radiusHandles.filter((candidate) => candidate.roomId === selectedRoomId)) {
+    for (const handle of layout.radiusHandles.filter((candidate) => visibleRoomIds.has(candidate.roomId))) {
       const mesh = new THREE.Mesh(runtime.cube, runtime.materials.handle);
       mesh.position.set(
         handle.cx + Math.cos(handle.angle) * handle.radius,
@@ -395,6 +568,25 @@ function rebuildScene(runtime: SceneRuntime, layout: GeneratedLayout, settings: 
       mesh.userData.radiusHandle = handle;
       runtime.handles.add(mesh);
     }
+    // Long blue grips sit on each straight room edge. Dragging one perpendicular
+    // to itself adds or removes a complete row of 2 m cells.
+    for (const control of mergeWallResizeControls(layout.wallResizeHandles.filter((candidate) => visibleRoomIds.has(candidate.roomId)))) {
+      const handle = control.handles.find((candidate) => candidate.roomId === selectedRoomId) ?? control.handles[0];
+      const dx = handle.end.x - handle.start.x;
+      const dy = handle.end.y - handle.start.y;
+      const length = Math.hypot(dx, dy);
+      const mesh = new THREE.Mesh(runtime.cube, runtime.materials.wallHandle);
+      mesh.position.set(
+        (handle.start.x + handle.end.x) / 2,
+        0.4,
+        planYToWorldZ((handle.start.y + handle.end.y) / 2),
+      );
+      mesh.rotation.y = Math.atan2(dy, dx);
+      mesh.scale.set(Math.max(0.7, length - 0.55), 0.14, 0.3);
+      mesh.renderOrder = 29;
+      mesh.userData.wallResizeControl = control;
+      runtime.handles.add(mesh);
+    }
   }
   runtime.render();
 }
@@ -402,6 +594,9 @@ function rebuildScene(runtime: SceneRuntime, layout: GeneratedLayout, settings: 
 export function ThreeViewport({
   layout,
   settings,
+  hdriUrl,
+  hdriKind,
+  cubeMapUrls,
   fitSignal,
   tool,
   selectedRoomId,
@@ -412,6 +607,8 @@ export function ThreeViewport({
   onCornerEdit,
   onCornerRemove,
   onCircleResize,
+  onRoomMove,
+  onWallResize,
   onNotice,
 }: ThreeViewportProps) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -429,6 +626,8 @@ export function ThreeViewport({
   const onCornerEditRef = useRef(onCornerEdit);
   const onCornerRemoveRef = useRef(onCornerRemove);
   const onCircleResizeRef = useRef(onCircleResize);
+  const onRoomMoveRef = useRef(onRoomMove);
+  const onWallResizeRef = useRef(onWallResize);
 
   onCommitRef.current = onCommit;
   onNoticeRef.current = onNotice;
@@ -437,6 +636,8 @@ export function ThreeViewport({
   onCornerEditRef.current = onCornerEdit;
   onCornerRemoveRef.current = onCornerRemove;
   onCircleResizeRef.current = onCircleResize;
+  onRoomMoveRef.current = onRoomMove;
+  onWallResizeRef.current = onWallResize;
 
   useEffect(() => {
     const host = hostRef.current;
@@ -479,8 +680,32 @@ export function ThreeViewport({
       trim: makeMaterial(0x2d342f, 0.62),
       handle: new THREE.MeshBasicMaterial({ color: 0xc6d36e, depthTest: false, depthWrite: false }),
       handleActive: new THREE.MeshBasicMaterial({ color: 0xcf5c3d, depthTest: false, depthWrite: false }),
+      wallHandle: new THREE.MeshBasicMaterial({ color: 0x48a9c5, transparent: true, opacity: 0.9, depthTest: false, depthWrite: false }),
     };
-    const runtime: SceneRuntime = { scene, camera, renderer, controls, generated, handles, assets, cube, materials, render: () => renderer.render(scene, camera), setTool: () => undefined };
+    const hemisphere = new THREE.HemisphereLight(0xf2eee4, 0x1a211d, 2.25);
+    const sun = new THREE.DirectionalLight(0xfff3dc, 3.2);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.bias = -0.0003;
+    scene.add(hemisphere, sun, sun.target);
+    const runtime: SceneRuntime = {
+      scene,
+      camera,
+      renderer,
+      controls,
+      hemisphere,
+      sun,
+      hdriBackgroundMap: null,
+      hdriEnvironmentMap: null,
+      hdriLoadVersion: 0,
+      generated,
+      handles,
+      assets,
+      cube,
+      materials,
+      render: () => renderer.render(scene, camera),
+      setTool: () => undefined,
+    };
     runtimeRef.current = runtime;
 
     // The GLBs carry geometry only; their shared trimsheets live in /textures and are
@@ -505,21 +730,6 @@ export function ThreeViewport({
       const { unique, issued } = sharedTextures.stats();
       console.info(`[assets] ${issued} texture slots served by ${unique} unique images; ${renderer.info.memory.textures} GPU textures live`);
     });
-
-    scene.add(new THREE.HemisphereLight(0xf2eee4, 0x1a211d, 2.25));
-    const keyLight = new THREE.DirectionalLight(0xfff3dc, 3.2);
-    keyLight.position.set(18, 28, 14);
-    keyLight.castShadow = true;
-    keyLight.shadow.mapSize.set(1024, 1024);
-    keyLight.shadow.camera.left = -45;
-    keyLight.shadow.camera.right = 45;
-    keyLight.shadow.camera.top = 45;
-    keyLight.shadow.camera.bottom = -45;
-    keyLight.shadow.bias = -0.0003;
-    scene.add(keyLight);
-    const rimLight = new THREE.DirectionalLight(0xb7c7b8, 1.2);
-    rimLight.position.set(-20, 12, -24);
-    scene.add(rimLight);
 
     const groundMaterial = new THREE.MeshStandardMaterial({ color: 0x202622, roughness: 0.96 });
     const groundGeometry = new THREE.PlaneGeometry(1000, 1000);
@@ -575,6 +785,8 @@ export function ThreeViewport({
     let drawState: DrawState | null = null;
     let cornerDrag: CornerDragState | null = null;
     let radiusDrag: RadiusDragState | null = null;
+    let roomMoveDrag: RoomMoveDragState | null = null;
+    let wallResizeDrag: WallResizeDragState | null = null;
 
     const setRay = (event: PointerEvent) => {
       const rect = renderer.domElement.getBoundingClientRect();
@@ -686,14 +898,52 @@ export function ThreeViewport({
       if (measureRef.current) measureRef.current.hidden = true;
       runtime.render();
     };
-    const roomAtPoint = (point: PlanPoint) => layoutRef.current.roomGrounds.find(
-      (groundShape) => pointInPolygon(point, groundShape.outer) && !groundShape.holes.some((hole) => pointInPolygon(point, hole)),
-    )?.roomId ?? null;
+    const finishRoomMove = (cancel: boolean) => {
+      if (!roomMoveDrag) return;
+      const drag = roomMoveDrag;
+      if (!cancel && (drag.dxCells !== 0 || drag.dyCells !== 0)) {
+        onRoomMoveRef.current(drag.roomId, drag.dxCells, drag.dyCells);
+      }
+      if (renderer.domElement.hasPointerCapture(drag.pointerId)) renderer.domElement.releasePointerCapture(drag.pointerId);
+      roomMoveDrag = null;
+      controls.enabled = true;
+      if (measureRef.current) measureRef.current.hidden = true;
+      runtime.render();
+    };
+    const finishWallResize = (cancel: boolean) => {
+      if (!wallResizeDrag) return;
+      const drag = wallResizeDrag;
+      if (!cancel && drag.steps !== 0) {
+        const reference = drag.handles[0];
+        onWallResizeRef.current(drag.handles.map((handle) => ({
+          handle,
+          // The two sides of a shared wall face in opposite directions. A positive
+          // movement expands one room and contracts the neighbour, moving one wall.
+          steps: Math.round(drag.steps * (handle.outwardX * reference.outwardX + handle.outwardY * reference.outwardY)),
+        }))); 
+      }
+      if (renderer.domElement.hasPointerCapture(drag.pointerId)) renderer.domElement.releasePointerCapture(drag.pointerId);
+      wallResizeDrag = null;
+      controls.enabled = true;
+      if (measureRef.current) measureRef.current.hidden = true;
+      runtime.render();
+    };
+    const roomAtPoint = (point: PlanPoint) => {
+      const candidates = layoutRef.current.roomHitAreas.filter(
+        (groundShape) => pointInPolygon(point, groundShape.outer) && !groundShape.holes.some((hole) => pointInPolygon(point, hole)),
+      );
+      // In an overlap, keep the currently selected logical room under the pointer. Clicking
+      // an exposed part of another member still selects it normally.
+      const selected = candidates.find((groundShape) => groundShape.roomId === selectedRoomRef.current);
+      return selected?.roomId ?? candidates[0]?.roomId ?? null;
+    };
 
     const handlePointerDown = (event: PointerEvent) => {
-      if (event.button === 2 && (cornerDrag || radiusDrag)) {
+      if (event.button === 2 && (cornerDrag || radiusDrag || roomMoveDrag || wallResizeDrag)) {
         finishCornerDrag(true);
         finishRadiusDrag(true);
+        finishRoomMove(true);
+        finishWallResize(true);
         event.preventDefault();
         event.stopPropagation();
         return;
@@ -723,10 +973,28 @@ export function ThreeViewport({
           event.preventDefault();
           return;
         }
+        const wallControl = handleHit?.object.userData.wallResizeControl as MergedWallResizeControl | undefined;
+        const wallStart = wallControl ? pointerToPlan(event) : null;
+        if (wallControl && wallStart) {
+          const primaryHandle = wallControl.handles.find((handle) => handle.roomId === selectedRoomRef.current) ?? wallControl.handles[0];
+          onSelectRoomRef.current(primaryHandle.roomId);
+          onActiveCornerRef.current(null);
+          wallResizeDrag = { pointerId: event.pointerId, handles: wallControl.handles, start: wallStart, steps: 0 };
+          controls.enabled = false;
+          renderer.domElement.setPointerCapture(event.pointerId);
+          event.preventDefault();
+          return;
+        }
         const point = pointerToPlan(event);
         const roomId = point ? roomAtPoint(point) : null;
         onSelectRoomRef.current(roomId);
         onActiveCornerRef.current(null);
+        const startCell = roomId ? pointerToCell(event) : null;
+        if (roomId && startCell) {
+          roomMoveDrag = { pointerId: event.pointerId, roomId, start: startCell, dxCells: 0, dyCells: 0 };
+          controls.enabled = false;
+          renderer.domElement.setPointerCapture(event.pointerId);
+        }
         event.preventDefault();
         return;
       }
@@ -780,6 +1048,36 @@ export function ThreeViewport({
         event.preventDefault();
         return;
       }
+      if (wallResizeDrag?.pointerId === event.pointerId) {
+        const point = pointerToPlan(event);
+        if (!point) return;
+        const reference = wallResizeDrag.handles[0];
+        const { start } = wallResizeDrag;
+        const distance = (point.x - start.x) * reference.outwardX + (point.y - start.y) * reference.outwardY;
+        wallResizeDrag.steps = Math.round(distance / CELL_SIZE);
+        if (measureRef.current) {
+          measureRef.current.hidden = false;
+          measureRef.current.textContent = wallResizeDrag.steps === 0
+            ? "Drag perpendicular to resize"
+            : `${wallResizeDrag.steps > 0 ? "Expand" : "Contract"} ${Math.abs(wallResizeDrag.steps) * CELL_SIZE} m`;
+        }
+        event.preventDefault();
+        return;
+      }
+      if (roomMoveDrag?.pointerId === event.pointerId) {
+        const cell = pointerToCell(event);
+        if (!cell) return;
+        roomMoveDrag.dxCells = cell.x - roomMoveDrag.start.x;
+        roomMoveDrag.dyCells = cell.y - roomMoveDrag.start.y;
+        if (measureRef.current) {
+          measureRef.current.hidden = false;
+          measureRef.current.textContent = roomMoveDrag.dxCells === 0 && roomMoveDrag.dyCells === 0
+            ? "Drag to move room"
+            : `Move ${roomMoveDrag.dxCells * CELL_SIZE} m, ${roomMoveDrag.dyCells * CELL_SIZE} m`;
+        }
+        event.preventDefault();
+        return;
+      }
       const cell = pointerToCell(event);
       if (drawState?.pointerId === event.pointerId) {
         if (cell) { drawState.current = cell; showDraft(drawState); }
@@ -797,6 +1095,16 @@ export function ThreeViewport({
       }
       if (radiusDrag?.pointerId === event.pointerId) {
         finishRadiusDrag(false);
+        event.preventDefault();
+        return;
+      }
+      if (wallResizeDrag?.pointerId === event.pointerId) {
+        finishWallResize(false);
+        event.preventDefault();
+        return;
+      }
+      if (roomMoveDrag?.pointerId === event.pointerId) {
+        finishRoomMove(false);
         event.preventDefault();
         return;
       }
@@ -838,13 +1146,17 @@ export function ThreeViewport({
     const handlePointerCancel = (event: PointerEvent) => {
       if (cornerDrag?.pointerId === event.pointerId) finishCornerDrag(true);
       if (radiusDrag?.pointerId === event.pointerId) finishRadiusDrag(true);
+      if (roomMoveDrag?.pointerId === event.pointerId) finishRoomMove(true);
+      if (wallResizeDrag?.pointerId === event.pointerId) finishWallResize(true);
       if (drawState?.pointerId === event.pointerId) cancelDrawing();
     };
-    const handlePointerLeave = () => { if (!drawState && !cornerDrag && !radiusDrag) showHover(null); };
+    const handlePointerLeave = () => { if (!drawState && !cornerDrag && !radiusDrag && !roomMoveDrag && !wallResizeDrag) showHover(null); };
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         if (cornerDrag) finishCornerDrag(true);
         else if (radiusDrag) finishRadiusDrag(true);
+        else if (wallResizeDrag) finishWallResize(true);
+        else if (roomMoveDrag) finishRoomMove(true);
         else if (drawState) cancelDrawing();
       }
     };
@@ -853,6 +1165,8 @@ export function ThreeViewport({
       cancelDrawing();
       if (cornerDrag) finishCornerDrag(true);
       if (radiusDrag) finishRadiusDrag(true);
+      if (roomMoveDrag) finishRoomMove(true);
+      if (wallResizeDrag) finishWallResize(true);
       setInteractionColor(nextTool === "erase" ? "erase" : "draw");
       hoverMesh.visible = false;
       runtime.render();
@@ -875,6 +1189,7 @@ export function ThreeViewport({
       runtime.render();
     });
     resizeObserver.observe(host);
+    updateDynamicLighting(runtime, layoutRef.current, settingsRef.current);
     rebuildScene(runtime, layoutRef.current, settingsRef.current, selectedRoomRef.current, activeCornerRef.current);
     fitCamera(runtime, layoutRef.current);
 
@@ -905,7 +1220,10 @@ export function ThreeViewport({
       materials.trim.dispose();
       materials.handle.dispose();
       materials.handleActive.dispose();
+      materials.wallHandle.dispose();
       sharedTextures.dispose();
+      runtime.hdriBackgroundMap?.dispose();
+      runtime.hdriEnvironmentMap?.dispose();
       renderer.dispose();
       renderer.domElement.remove();
       runtimeRef.current = null;
@@ -913,11 +1231,62 @@ export function ThreeViewport({
   }, []);
 
   useEffect(() => {
+    const runtime = runtimeRef.current;
+    if (!runtime) return;
+    const version = ++runtime.hdriLoadVersion;
+    if (!hdriUrl && !cubeMapUrls) {
+      runtime.hdriBackgroundMap?.dispose();
+      runtime.hdriEnvironmentMap?.dispose();
+      runtime.hdriBackgroundMap = null;
+      runtime.hdriEnvironmentMap = null;
+      updateDynamicLighting(runtime, layoutRef.current, settingsRef.current);
+      runtime.render();
+      return;
+    }
+
+    const sourcePromise: Promise<THREE.Texture> = cubeMapUrls
+      ? new THREE.CubeTextureLoader().loadAsync(cubeMapUrls)
+      : hdriKind === "exr"
+        ? new EXRLoader().loadAsync(hdriUrl!)
+        : new RGBELoader().loadAsync(hdriUrl!);
+    void sourcePromise.then((texture) => {
+      if (runtimeRef.current !== runtime || runtime.hdriLoadVersion !== version) {
+        texture.dispose();
+        return;
+      }
+      const isCubeMap = texture instanceof THREE.CubeTexture;
+      if (isCubeMap) {
+        texture.mapping = THREE.CubeReflectionMapping;
+        texture.colorSpace = THREE.SRGBColorSpace;
+      } else {
+        texture.mapping = THREE.EquirectangularReflectionMapping;
+      }
+      const pmrem = new THREE.PMREMGenerator(runtime.renderer);
+      pmrem.compileEquirectangularShader();
+      const environment = isCubeMap
+        ? pmrem.fromCubemap(texture as THREE.CubeTexture).texture
+        : pmrem.fromEquirectangular(texture).texture;
+      pmrem.dispose();
+      runtime.hdriBackgroundMap?.dispose();
+      runtime.hdriEnvironmentMap?.dispose();
+      runtime.hdriBackgroundMap = texture;
+      runtime.hdriEnvironmentMap = environment;
+      updateDynamicLighting(runtime, layoutRef.current, settingsRef.current);
+      runtime.render();
+    }, (error) => {
+      if (runtime.hdriLoadVersion === version) console.error("[lighting] failed to load HDRI", error);
+    });
+  }, [hdriUrl, hdriKind, cubeMapUrls]);
+
+  useEffect(() => {
     layoutRef.current = layout;
     settingsRef.current = settings;
     selectedRoomRef.current = selectedRoomId;
     activeCornerRef.current = activeCorner;
-    if (runtimeRef.current) rebuildScene(runtimeRef.current, layout, settings, selectedRoomId, activeCorner);
+    if (runtimeRef.current) {
+      updateDynamicLighting(runtimeRef.current, layout, settings);
+      rebuildScene(runtimeRef.current, layout, settings, selectedRoomId, activeCorner);
+    }
   }, [layout, settings, selectedRoomId, activeCorner]);
 
   useEffect(() => {
@@ -935,7 +1304,7 @@ export function ThreeViewport({
         ? "Draw circular room"
         : "Draw cells";
   const leftHint = tool === "select"
-    ? "select / drag handle"
+    ? "move room / resize wall"
     : tool === "erase"
       ? "erase"
       : tool === "circle"

@@ -125,6 +125,18 @@ button:disabled { opacity: .38; cursor: not-allowed; }
 .fixed-specs span:last-child { border-right: 0; }
 .fixed-specs i { color: #92968f; font-size: 8px; font-style: normal; text-transform: uppercase; }
 .fixed-specs b { margin-top: 4px; color: #3d433e; font: 700 8.5px ui-monospace, monospace; white-space: nowrap; }
+.wall-transform-locks { grid-template-columns: repeat(2, 1fr); }
+.lighting-presets { margin-top: 8px; display: grid; grid-template-columns: repeat(4, 1fr); border: 1px solid #d4cdc1; }
+.lighting-presets button { min-width: 0; height: 28px; padding: 0 3px; border: 0; border-right: 1px solid #d4cdc1; color: #5f655f; background: #f1ede4; font-size: 8.5px; font-weight: 750; cursor: pointer; }
+.lighting-presets button:last-child { border-right: 0; }
+.lighting-presets button:hover { color: var(--accent-dark); background: #e7e1d6; }
+.hdri-upload-row { min-height: 38px; display: flex; align-items: center; gap: 7px; border-bottom: 1px solid #ddd7cc; }
+.hdri-upload-row button { height: 26px; flex: 0 0 auto; padding: 0 8px; border: 1px solid #c9c2b6; color: #4f554f; background: #f1ede4; font-size: 9px; font-weight: 750; cursor: pointer; }
+.hdri-upload-row button:hover { border-color: var(--accent); color: var(--accent-dark); }
+.hdri-upload-row span { min-width: 0; flex: 1; overflow: hidden; color: #777d76; font: 8.5px ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.hdri-upload-row .hdri-clear { padding: 0 6px; color: #8e3a2c; }
+.environment-clear { width: 100%; height: 28px; margin-top: 7px; border: 1px solid #c9c2b6; color: #8e3a2c; background: transparent; font-size: 9px; font-weight: 750; cursor: pointer; }
+.environment-clear:hover { border-color: #8e3a2c; background: #eee3dd; }
 .plan-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; padding-top: 18px; }
 .plan-actions button.danger { color: #8e3a2c; }
 

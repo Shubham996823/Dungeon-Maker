@@ -15,7 +15,7 @@ import {
   signedArea,
   traceCellBoundaryLoops,
 } from "./footprint";
-import { buildLayout, CELL_SIZE, rectangleCells } from "./layout";
+import { buildLayout, CELL_SIZE, normalizeCells, rectangleCells } from "./layout";
 import type { BuildSettings, CircleShape, Room } from "./types";
 
 const settings: BuildSettings = {
@@ -38,6 +38,13 @@ const settings: BuildSettings = {
   pillarInset: 0,
   curveQuality: 64,
   sharedWallSeparation: 0.04,
+  dynamicLighting: true,
+  timeOfDay: 13,
+  ambientLight: 1,
+  exposure: 1.05,
+  hdriBackground: true,
+  hdriIntensity: 1,
+  hdriRotation: 0,
 };
 
 function room(id: string, x: number, y: number, width: number, depth: number): Room {
@@ -274,6 +281,8 @@ describe("merged rooms (boolean union)", () => {
         expect(Math.abs(Math.hypot(point.x - edgeCircle.cx, point.y - edgeCircle.cy) - edgeCircle.radius)).toBeLessThan(MM);
       }
     }
+    expect(geometry.wallResizeHandles.length).toBeGreaterThan(0);
+    expect(geometry.wallResizeHandles.every((handle) => handle.roomId === "mixed")).toBe(true);
   });
 
   it("never carries a straight run around a corner after a circle/square union", () => {
@@ -419,6 +428,22 @@ describe("merged rooms (boolean union)", () => {
     expect(layout.stats.floorTiles).toBe(Math.round(area / (CELL_SIZE * CELL_SIZE)));
     // The old per-part sum counted the submerged half of the disc as well.
     expect(layout.stats.floorTiles).toBeLessThan(12 + Math.round(discArea(edgeCircle) / 4));
+  });
+});
+
+describe("merged square-room pillars", () => {
+  it("places a pillar on every convex and concave corner of an overlapping square union", () => {
+    // Two overlapping rectangles form an L outline with five convex corners and one
+    // concave merge corner. All six direction changes need a pillar.
+    const cells = normalizeCells([
+      ...rectangleCells(0, 0, 4, 2),
+      ...rectangleCells(0, 0, 2, 4),
+    ]);
+    const room = mixedRoom(cells, []);
+    const geometry = buildEditedRoomGeometry(room, 64);
+    expect(geometry.pillarAnchors).toHaveLength(6);
+    expect(geometry.pillarAnchors.some((anchor) => anchor.point.x === 4 && anchor.point.y === 4)).toBe(true);
+    expect(buildLayout(cells, settings, [room]).pillars).toHaveLength(6);
   });
 });
 

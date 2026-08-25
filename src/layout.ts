@@ -13,9 +13,10 @@ import type {
   Side,
   Variant,
   WallPath,
+  WallResizeHandle,
   WallSegment,
 } from "./types";
-import { buildEditedRoomGeometry, circleOverlapsCell, circlesOverlap, pathLength, polygonArea } from "./footprint";
+import { buildEditedRoomGeometry, circleOverlapsCell, circlesOverlap, pathLength, polygonArea, unionFinishedRoomGeometry } from "./footprint";
 
 export const CELL_SIZE = 2;
 export const WALL_HEIGHT = 3;
@@ -45,6 +46,47 @@ export function normalizeCells(cells: Cell[]): Cell[] {
     unique.set(cellKey(x, y), { x, y });
   }
   return [...unique.values()].sort((a, b) => a.y - b.y || a.x - b.x);
+}
+
+/** Move one axis-aligned exterior wall by whole 2 m modules. */
+export function resizeRoomCells(inputCells: Cell[], handle: WallResizeHandle, steps: number): Cell[] {
+  const amount = Math.trunc(steps);
+  if (!amount) return normalizeCells(inputCells);
+  const cells = new Map(normalizeCells(inputCells).map((cell) => [cellKey(cell.x, cell.y), cell]));
+  const horizontal = Math.abs(handle.end.x - handle.start.x) >= Math.abs(handle.end.y - handle.start.y);
+
+  if (horizontal) {
+    const outward = Math.sign(handle.outwardY);
+    if (!outward) return [...cells.values()];
+    const line = Math.round(handle.start.y / CELL_SIZE);
+    const inside = outward > 0 ? line - 1 : line;
+    const start = Math.round(Math.min(handle.start.x, handle.end.x) / CELL_SIZE);
+    const end = Math.round(Math.max(handle.start.x, handle.end.x) / CELL_SIZE);
+    for (let layer = amount > 0 ? 1 : 0; layer < (amount > 0 ? amount + 1 : -amount); layer += 1) {
+      const y = amount > 0 ? inside + outward * layer : inside - outward * layer;
+      for (let x = start; x < end; x += 1) {
+        const key = cellKey(x, y);
+        if (amount > 0) cells.set(key, { x, y });
+        else cells.delete(key);
+      }
+    }
+  } else {
+    const outward = Math.sign(handle.outwardX);
+    if (!outward) return [...cells.values()];
+    const line = Math.round(handle.start.x / CELL_SIZE);
+    const inside = outward > 0 ? line - 1 : line;
+    const start = Math.round(Math.min(handle.start.y, handle.end.y) / CELL_SIZE);
+    const end = Math.round(Math.max(handle.start.y, handle.end.y) / CELL_SIZE);
+    for (let layer = amount > 0 ? 1 : 0; layer < (amount > 0 ? amount + 1 : -amount); layer += 1) {
+      const x = amount > 0 ? inside + outward * layer : inside - outward * layer;
+      for (let y = start; y < end; y += 1) {
+        const key = cellKey(x, y);
+        if (amount > 0) cells.set(key, { x, y });
+        else cells.delete(key);
+      }
+    }
+  }
+  return normalizeCells([...cells.values()]);
 }
 
 function mulberry32(seed: number) {
@@ -357,6 +399,83 @@ function addCanonicalPath(
   byPath.set(key, path);
 }
 
+/**
+ * Geometry-only union: overlapping room records render as one footprint, while the app
+ * still retains every original room so dragging one away restores its previous identity.
+ */
+function geometryArea(geometry: ReturnType<typeof buildEditedRoomGeometry>) {
+  return geometry.grounds.reduce((total, ground) => total + polygonArea(ground.outer)
+    - ground.holes.reduce((holes, hole) => holes + polygonArea(hole), 0), 0);
+}
+
+function roomsOverlap(
+  a: Room,
+  b: Room,
+  geometryByRoom: Map<string, ReturnType<typeof buildEditedRoomGeometry>>,
+) {
+  const aGeometry = geometryByRoom.get(a.id);
+  const bGeometry = geometryByRoom.get(b.id);
+  if (!aGeometry || !bGeometry) return false;
+  // Compare the unioned finished outlines with their separate areas. This is a strict
+  // area test, so adjacent/tangent rooms do not silently merge.
+  const union = unionFinishedRoomGeometry("overlap-probe", [aGeometry, bGeometry]);
+  return geometryArea(union) < geometryArea(aGeometry) + geometryArea(bGeometry) - 1e-4;
+}
+
+interface LayoutRoomGroup {
+  room: Room;
+  members: Room[];
+}
+
+function mergeOverlappingRoomsForLayout(
+  rooms: Room[],
+  geometryByRoom: Map<string, ReturnType<typeof buildEditedRoomGeometry>>,
+): LayoutRoomGroup[] {
+  const pending = [...rooms];
+  const merged: LayoutRoomGroup[] = [];
+  while (pending.length) {
+    const group = [pending.shift()!];
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (let index = pending.length - 1; index >= 0; index -= 1) {
+        if (!group.some((room) => roomsOverlap(room, pending[index], geometryByRoom))) continue;
+        group.push(pending[index]);
+        pending.splice(index, 1);
+        changed = true;
+      }
+    }
+    if (group.length === 1) {
+      merged.push({ room: group[0], members: group });
+      continue;
+    }
+    merged.push({ members: group, room: group[0] });
+  }
+  return merged;
+}
+
+function sameGridVertex(a: CornerHandle, b: CornerHandle) {
+  return a.vertexX === b.vertexX && a.vertexY === b.vertexY;
+}
+
+function sourceOwnsVisualWall(source: WallResizeHandle, visual: WallResizeHandle) {
+  const sourceHorizontal = Math.abs(source.end.x - source.start.x) >= Math.abs(source.end.y - source.start.y);
+  const visualHorizontal = Math.abs(visual.end.x - visual.start.x) >= Math.abs(visual.end.y - visual.start.y);
+  if (sourceHorizontal !== visualHorizontal) return false;
+  const dot = source.outwardX * visual.outwardX + source.outwardY * visual.outwardY;
+  if (dot < 0.9) return false;
+  if (sourceHorizontal) {
+    if (Math.abs(source.start.y - visual.start.y) > 1e-4) return false;
+    const sourceMin = Math.min(source.start.x, source.end.x) - 1e-4;
+    const sourceMax = Math.max(source.start.x, source.end.x) + 1e-4;
+    return Math.min(visual.start.x, visual.end.x) >= sourceMin && Math.max(visual.start.x, visual.end.x) <= sourceMax;
+  }
+  if (Math.abs(source.start.x - visual.start.x) > 1e-4) return false;
+  const sourceMin = Math.min(source.start.y, source.end.y) - 1e-4;
+  const sourceMax = Math.max(source.start.y, source.end.y) + 1e-4;
+  return Math.min(visual.start.y, visual.end.y) >= sourceMin && Math.max(visual.start.y, visual.end.y) <= sourceMax;
+}
+
 function addRoomGeometry(
   rooms: Room[],
   settings: BuildSettings,
@@ -364,17 +483,64 @@ function addRoomGeometry(
   wallPaths: WallPath[],
   pillars: Pillar[],
   roomGrounds: RoomGround[],
+  roomHitAreas: RoomGround[],
+  roomGroups: string[][],
   cornerHandles: CornerHandle[],
   radiusHandles: RadiusHandle[],
+  wallResizeHandles: WallResizeHandle[],
 ) {
   const byEdge = new Map<string, WallSegment>();
   const byPath = new Map<string, WallPath>();
   const pillarKeys = new Set<string>();
+
+  const interactionByRoom = new Map<string, ReturnType<typeof buildEditedRoomGeometry>>();
+  // Hit areas and radius controls always belong to original logical rooms.
   for (const room of rooms) {
-    const geometry = buildEditedRoomGeometry(room, settings.curveQuality);
+    const interactionGeometry = buildEditedRoomGeometry(room, settings.curveQuality);
+    interactionByRoom.set(room.id, interactionGeometry);
+    roomHitAreas.push(...interactionGeometry.grounds);
+    radiusHandles.push(...interactionGeometry.radiusHandles);
+  }
+
+  // Render geometry may union several overlapping logical rooms into one continuous shell.
+  for (const group of mergeOverlappingRoomsForLayout(rooms, interactionByRoom)) {
+    const { room } = group;
+    roomGroups.push(group.members.map((member) => member.id));
+    const geometry = group.members.length === 1
+      ? interactionByRoom.get(room.id)!
+      : unionFinishedRoomGeometry(room.id, group.members.map((member) => interactionByRoom.get(member.id)!));
     roomGrounds.push(...geometry.grounds);
-    cornerHandles.push(...geometry.handles);
-    radiusHandles.push(...geometry.radiusHandles);
+
+    const sourceCorners = group.members.flatMap((member) => interactionByRoom.get(member.id)?.handles ?? []);
+    if (geometry.handles.length) {
+      for (const visualCorner of geometry.handles) {
+        const owners = sourceCorners.filter((source) => sameGridVertex(source, visualCorner));
+        cornerHandles.push(...(owners.length ? owners : [visualCorner]));
+      }
+    } else {
+      // A final-footprint union has no synthetic grid-corner handles of its own. Retain
+      // only original corners that still land on the visible exterior boundary.
+      const boundaryVertices = new Set(geometry.grounds.flatMap((ground) => ground.outer)
+        .map((point) => `${point.x.toFixed(4)},${point.y.toFixed(4)}`));
+      cornerHandles.push(...sourceCorners.filter((corner) =>
+        boundaryVertices.has(`${(corner.vertexX * CELL_SIZE).toFixed(4)},${(corner.vertexY * CELL_SIZE).toFixed(4)}`),
+      ));
+    }
+
+    const sourceWalls = group.members.flatMap((member) => interactionByRoom.get(member.id)?.wallResizeHandles ?? []);
+    for (const visualWall of geometry.wallResizeHandles) {
+      const owners = sourceWalls.filter((source) => sourceOwnsVisualWall(source, visualWall));
+      if (!owners.length) {
+        wallResizeHandles.push(visualWall);
+        continue;
+      }
+      wallResizeHandles.push(...owners.map((owner) => ({
+        ...visualWall,
+        roomId: owner.roomId,
+        outwardX: owner.outwardX,
+        outwardY: owner.outwardY,
+      })));
+    }
     for (const path of geometry.paths) {
       if (path.kind !== "straight") {
         addCanonicalPath(wallPaths, byPath, path.points, path.kind, room);
@@ -420,12 +586,15 @@ export function buildLayout(inputCells: Cell[], settings: BuildSettings, rooms: 
   const walls: WallSegment[] = [];
   const wallPaths: WallPath[] = [];
   const roomGrounds: RoomGround[] = [];
+  const roomHitAreas: RoomGround[] = [];
+  const roomGroups: string[][] = [];
   const cornerHandles: CornerHandle[] = [];
   const radiusHandles: RadiusHandle[] = [];
+  const wallResizeHandles: WallResizeHandle[] = [];
   let corners: never[] = [];
   let pillars: Pillar[] = [];
   if (rooms.length) {
-    addRoomGeometry(rooms, settings, walls, wallPaths, pillars, roomGrounds, cornerHandles, radiusHandles);
+    addRoomGeometry(rooms, settings, walls, wallPaths, pillars, roomGrounds, roomHitAreas, roomGroups, cornerHandles, radiusHandles, wallResizeHandles);
   } else {
     const runs = boundaryRuns(cells, keys);
     for (const run of runs) addPerimeterRun(walls, run, settings, random);
@@ -454,8 +623,11 @@ export function buildLayout(inputCells: Cell[], settings: BuildSettings, rooms: 
     corners,
     pillars,
     roomGrounds,
+    roomHitAreas,
+    roomGroups,
     cornerHandles,
     radiusHandles,
+    wallResizeHandles,
     bounds: getGroundBounds(roomGrounds, getBounds(cells)),
     stats: {
       area: shapeArea,
