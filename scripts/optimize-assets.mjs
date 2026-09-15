@@ -1,11 +1,10 @@
 /**
- * Asset pipeline: `assets/models/*.glb` (source of truth, untouched) -> `public/`.
+ * Asset pipeline: Blender-generated `public/models/*.glb` -> optimized files in place.
  *
- * The source GLBs each embed their own copy of the same 2048x2048 trimsheet pair, so seven
- * models ship 46 MB to deliver 13 MB of unique pixels, and the GPU holds one upload per
- * (file, texture) pair rather than one per image. This script pulls every image out to a
- * single content-addressed file under `public/textures/` and leaves the GLB carrying nothing
- * but geometry and a URI reference.
+ * `assets/models/*.fbx` is the source of truth. `convert-fbx-assets.py` compiles each reusable
+ * FBX once into `public/models/`; this script then pulls embedded images out to a single
+ * content-addressed file under `public/textures/` and leaves each GLB carrying geometry plus
+ * URI references. It never creates wall/opening combination meshes.
  *
  * Download shrinks because duplicate bytes are gone and WebP replaces PNG. VRAM shrinks
  * because the runtime can now recognise two GLBs pointing at one URI as one texture --
@@ -14,7 +13,7 @@
  * The emitted GLBs use `images[].uri` with a WebP mime type and no `EXT_texture_webp`
  * declaration. That is deliberate: three's GLTFLoader resolves external URIs through the
  * browser's own image decoder, which handles WebP natively, and these files are build
- * artifacts consumed only by this app. The conformant originals stay in `assets/models/`.
+ * artifacts consumed only by this app. The conformant originals are the FBXs in `assets/`.
  *
  * Usage: npm run assets            (add --check to verify without writing)
  */
@@ -26,7 +25,7 @@ import sharp from "sharp";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..");
-const SOURCE_MODELS = join(ROOT, "assets", "models");
+const SOURCE_MODELS = join(ROOT, "public", "models");
 const SOURCE_THUMBS = join(ROOT, "assets", "Thumbnails");
 const OUT_MODELS = join(ROOT, "public", "models");
 const OUT_THUMBS = join(ROOT, "public", "Thumbnails");
@@ -58,6 +57,7 @@ const ENCODE = {
 };
 
 const checkOnly = process.argv.includes("--check");
+const modelFilter = process.argv.find((argument) => argument.startsWith("--model="))?.slice("--model=".length) ?? null;
 
 function parseGlb(buffer, label) {
   if (buffer.length < 12 || buffer.readUInt32LE(0) !== GLB_MAGIC) {
@@ -178,7 +178,8 @@ async function convertThumbnails() {
 }
 
 async function main() {
-  const files = (await readdir(SOURCE_MODELS)).filter((name) => name.toLowerCase().endsWith(".glb")).sort();
+  const files = (await readdir(SOURCE_MODELS)).filter((name) => name.toLowerCase().endsWith(".glb")
+    && (!modelFilter || name === `${modelFilter}.glb`)).sort();
   if (!files.length) throw new Error(`no .glb files in ${SOURCE_MODELS}`);
   if (!checkOnly) {
     await mkdir(OUT_MODELS, { recursive: true });
@@ -199,7 +200,14 @@ async function main() {
     const imageViews = new Set();
 
     for (const [index, image] of (json.images ?? []).entries()) {
-      if (image.uri) continue; // already external
+      if (image.uri) {
+        // Re-running against an already optimized runtime asset is valid. In check mode,
+        // also prove its referenced image still exists instead of silently skipping it.
+        if (checkOnly && !image.uri.startsWith("data:")) {
+          await readFile(resolve(SOURCE_MODELS, image.uri));
+        }
+        continue;
+      }
       if (image.bufferView == null) throw new Error(`${file}: image ${index} has neither uri nor bufferView`);
       const view = json.bufferViews[image.bufferView];
       const bytes = bin.subarray(view.byteOffset ?? 0, (view.byteOffset ?? 0) + view.byteLength);
@@ -273,7 +281,7 @@ async function main() {
   const modelsFrom = report.reduce((sum, row) => sum + row.from, 0);
   const modelsTo = report.reduce((sum, row) => sum + row.to, 0);
   const texturesTo = [...textures.values()].reduce((sum, entry) => sum + entry.encoded.length, 0);
-  const thumbs = await convertThumbnails();
+  const thumbs = modelFilter ? [] : await convertThumbnails();
   const thumbsFrom = thumbs.reduce((sum, row) => sum + row.from, 0);
   const thumbsTo = thumbs.reduce((sum, row) => sum + row.to, 0);
   const kb = (bytes) => `${(bytes / 1024).toFixed(0)} kB`;

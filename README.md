@@ -30,6 +30,7 @@ npm test
 - Zoom: use the mouse wheel.
 - Perspective and top-view controls remain available while drafting.
 - Keyboard: `D` Draw, `E` Erase, `0` Fit, and `Ctrl/Cmd + Z` Undo.
+- Openings: choose a door/window or Remove, then click the centre of a straight 2 m wall (`O`).
 
 Projects autosave in local browser storage and can be exchanged as versioned JSON files.
 
@@ -43,7 +44,24 @@ Projects autosave in local browser storage and can be exchanged as versioned JSO
 - Overlapping cells are deduplicated and edge-adjacent shapes become open connections.
 - A three-cell vertex is treated as a concave pillar junction.
 
-The current renderer uses lightweight procedural modular geometry because no source mesh library accompanies the Blender script. The layout engine is independent of rendering, so the instanced boxes can later be replaced with GLB versions of `FL2x2`, `W3x4`, `W3x2`, `W3x1`, `CWL3x1`, `CWR3x1`, and `P3` assets without changing the drafting behavior.
+## Asset pipeline
+
+Authoring files live in `assets/models` (FBX) and `assets/Texture`. To rebuild the door,
+window, 2.5 m wall, pillar, and pre-cut boolean combinations, run Blender headlessly:
+
+```bash
+blender --background --factory-startup --python scripts/convert-fbx-assets.py
+npm run assets
+```
+
+The Blender pass creates GLB modules and exact cut-wall combinations. The Node pass strips
+duplicate embedded images, converts them to shared WebP textures, and writes deployable files
+to `public/models` and `public/textures`. Do not hand-edit generated files under `public`.
+
+- `WD_1`–`WD_3`: centred 1 m above the floor in a pre-cut wall.
+- `DR_2.5x1.5_1`: pre-cut 1.5 m doorway.
+- `DR_2.5x2_1`/`_2`: replace a complete 2 m wall module.
+- Cut-wall GLBs are loaded only when their opening/variant combination is used.
 
 ## Performance
 

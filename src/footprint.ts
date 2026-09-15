@@ -69,14 +69,18 @@ export function unionFinishedRoomGeometry(roomId: string, geometries: EditedRoom
     return tag;
   };
 
-  const sourceEdges = geometries.flatMap((geometry) => geometry.paths.flatMap((path) =>
-    path.points.slice(1).map((end, index) => ({ start: path.points[index], end, kind: path.kind })),
-  ));
-  const kindForEdge = (start: PlanPoint, end: PlanPoint): FootprintPath["kind"] => {
+  // A tag names an authored path run. In particular, all samples of one curve share one
+  // tag; treating every sample as a new run makes each sample look like a corner/pillar.
+  const sourceEdges = geometries.flatMap((geometry) => geometry.paths.flatMap((path) => {
+    const tag = claimTag(path.kind);
+    return path.points.slice(1).map((end, index) => ({ start: path.points[index], end, tag }));
+  }));
+  const fallbackStraightTag = claimTag("straight");
+  const tagForEdge = (start: PlanPoint, end: PlanPoint): number => {
     const dx = end.x - start.x;
     const dy = end.y - start.y;
     const length = Math.hypot(dx, dy);
-    if (length < EPSILON) return "straight";
+    if (length < EPSILON) return fallbackStraightTag;
     const midpoint = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
     const match = sourceEdges.find((edge) => {
       const ex = edge.end.x - edge.start.x;
@@ -87,12 +91,12 @@ export function unionFinishedRoomGeometry(roomId: string, geometries: EditedRoom
       const dot = (midpoint.x - edge.start.x) * ex + (midpoint.y - edge.start.y) * ey;
       return cross < 1e-3 && dot > -1e-3 && dot < edgeLength * edgeLength + 1e-3;
     });
-    return match?.kind ?? "straight";
+    return match?.tag ?? fallbackStraightTag;
   };
   const taggedRing = (points: PlanPoint[]) => points.map((point, index) => ({
     x: point.x,
     y: point.y,
-    tag: claimTag(kindForEdge(point, points[(index + 1) % points.length])),
+    tag: tagForEdge(point, points[(index + 1) % points.length]),
   }));
   const polygons: TaggedPoint[][] = [];
   for (const geometry of geometries) {

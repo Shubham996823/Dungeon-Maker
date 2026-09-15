@@ -4,7 +4,10 @@ import type {
   CircleShape,
   CornerHandle,
   GeneratedLayout,
+  FloorGround,
+  FloorRegion,
   LayoutBounds,
+  ManualWall,
   PlanPoint,
   Pillar,
   RadiusHandle,
@@ -13,17 +16,82 @@ import type {
   Side,
   Variant,
   WallPath,
+  WallDeletion,
   WallResizeHandle,
   WallSegment,
 } from "./types";
 import { buildEditedRoomGeometry, circleOverlapsCell, circlesOverlap, pathLength, polygonArea, unionFinishedRoomGeometry } from "./footprint";
 
 export const CELL_SIZE = 2;
+export const BALCONY_RAILING_MODULE_SIZE = 1;
 export const WALL_HEIGHT = 3;
+export const ROOM_ELEVATION_STEP = 0.25;
 /** Upper bound on the rectilinear cell count, so a runaway drag can't materialise 250k objects. */
 export const MAX_CELLS = 10_000;
 export const CORNER_ARM = 1;
 export const WALL_THICKNESS = 0.16;
+
+const TAU = Math.PI * 2;
+
+const positiveAngle = (angle: number) => ((angle % TAU) + TAU) % TAU;
+
+export interface CircularArc {
+  points: PlanPoint[];
+  center: PlanPoint;
+  radius: number;
+  length: number;
+  sweep: number;
+}
+
+/** Build the unique circular arc from start to end that passes through arcPoint. */
+export function circularArcThroughPoints(start: PlanPoint, arcPoint: PlanPoint, end: PlanPoint): CircularArc | null {
+  const determinant = 2 * (
+    start.x * (arcPoint.y - end.y)
+    + arcPoint.x * (end.y - start.y)
+    + end.x * (start.y - arcPoint.y)
+  );
+  if (Math.abs(determinant) < 1e-6) return null;
+
+  const startSquared = start.x * start.x + start.y * start.y;
+  const arcSquared = arcPoint.x * arcPoint.x + arcPoint.y * arcPoint.y;
+  const endSquared = end.x * end.x + end.y * end.y;
+  const center = {
+    x: (startSquared * (arcPoint.y - end.y) + arcSquared * (end.y - start.y) + endSquared * (start.y - arcPoint.y)) / determinant,
+    y: (startSquared * (end.x - arcPoint.x) + arcSquared * (start.x - end.x) + endSquared * (arcPoint.x - start.x)) / determinant,
+  };
+  const radius = Math.hypot(start.x - center.x, start.y - center.y);
+  if (!Number.isFinite(radius) || radius < 1e-4) return null;
+
+  const startAngle = Math.atan2(start.y - center.y, start.x - center.x);
+  const middleAngle = Math.atan2(arcPoint.y - center.y, arcPoint.x - center.x);
+  const endAngle = Math.atan2(end.y - center.y, end.x - center.x);
+  const ccwToMiddle = positiveAngle(middleAngle - startAngle);
+  const ccwToEnd = positiveAngle(endAngle - startAngle);
+  const direction = ccwToMiddle <= ccwToEnd + 1e-7 ? 1 : -1;
+  const directedDelta = (from: number, to: number) => direction > 0
+    ? positiveAngle(to - from)
+    : -positiveAngle(from - to);
+  const firstSweep = directedDelta(startAngle, middleAngle);
+  const secondSweep = directedDelta(middleAngle, endAngle);
+  const sweep = firstSweep + secondSweep;
+  const length = Math.abs(sweep) * radius;
+  const sampleSpan = (from: number, span: number) => {
+    const count = Math.min(256, Math.max(2, Math.ceil(Math.abs(span) * radius * 6)));
+    return Array.from({ length: count + 1 }, (_, index) => {
+      const angle = from + span * index / count;
+      return { x: center.x + Math.cos(angle) * radius, y: center.y + Math.sin(angle) * radius };
+    });
+  };
+  const first = sampleSpan(startAngle, firstSweep);
+  const second = sampleSpan(middleAngle, secondSweep);
+  // Reconstructed circle samples are subject to floating-point drift. Preserve the
+  // three authored clicks exactly so the first anchor can never creep as bulge changes.
+  first[0] = { ...start };
+  first[first.length - 1] = { ...arcPoint };
+  second[0] = { ...arcPoint };
+  second[second.length - 1] = { ...end };
+  return { points: [...first, ...second.slice(1)], center, radius, length, sweep };
+}
 
 const VARIANTS: Variant[] = ["A", "B", "C"];
 const SIDE_ORDER: Record<Side, number> = { S: 0, E: 1, N: 2, W: 3 };
@@ -322,6 +390,113 @@ function getGroundBounds(grounds: RoomGround[], fallback: LayoutBounds): LayoutB
   };
 }
 
+/** Remove one targeted fixed 2 m module while preserving every other part of the run. */
+export function eraseManualWallModule(manualWalls: ManualWall[], wallId: string, moduleIndex: number): ManualWall[] {
+  return eraseManualWallModules(manualWalls, wallId, [moduleIndex]);
+}
+
+/** Remove several modules from one authored run in a single stable split operation. */
+export function eraseManualWallModules(manualWalls: ManualWall[], wallId: string, moduleIndices: Iterable<number>): ManualWall[] {
+  const removed = new Set(moduleIndices);
+  const kept: ManualWall[] = [];
+  for (const wall of manualWalls) {
+    if (wall.id !== wallId) {
+      kept.push(wall);
+      continue;
+    }
+    if ((wall.kind ?? "straight") !== "straight") continue;
+    const dx = wall.end.x - wall.start.x;
+    const dy = wall.end.y - wall.start.y;
+    const horizontal = Math.abs(dx) >= Math.abs(dy);
+    const length = horizontal ? Math.abs(dx) : Math.abs(dy);
+    const moduleSize = wall.assembly === "balcony-railing" ? BALCONY_RAILING_MODULE_SIZE : CELL_SIZE;
+    const count = Math.round(length / moduleSize);
+    const direction = horizontal ? Math.sign(dx) : Math.sign(dy);
+    for (let index = 0; index < count; index += 1) {
+      const start = {
+        x: wall.start.x + (horizontal ? direction * index * moduleSize : 0),
+        y: wall.start.y + (horizontal ? 0 : direction * index * moduleSize),
+      };
+      const end = {
+        x: start.x + (horizontal ? direction * moduleSize : 0),
+        y: start.y + (horizontal ? 0 : direction * moduleSize),
+      };
+      if (removed.has(index)) continue;
+      const id = `${wall.id}:${index}`;
+      const center = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
+      const openings = wall.openings?.filter((opening) => Math.hypot(opening.cx - center.x, opening.cy - center.y) < moduleSize * 0.51)
+        .map((opening) => ({ ...opening, roomId: `manual-${id}`, manualWallId: id }));
+      kept.push({ ...wall, id, start, end, ...(openings ? { openings } : {}) });
+    }
+  }
+  return kept;
+}
+
+function pointOnSegment(point: PlanPoint, start: PlanPoint, end: PlanPoint) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared < 1e-8) return false;
+  const ratio = ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared;
+  if (ratio < -1e-5 || ratio > 1 + 1e-5) return false;
+  return Math.hypot(point.x - (start.x + dx * ratio), point.y - (start.y + dy * ratio)) < 1e-4;
+}
+
+/** Build the authored 1 m balcony modules and only the structurally meaningful posts. */
+export function buildBalconyAssembly(manualRailings: ManualWall[]) {
+  const balconyRailings: WallSegment[] = [];
+  const candidates = new Map<string, PlanPoint>();
+  for (const railing of manualRailings) {
+    candidates.set(roundedPoint(railing.start), railing.start);
+    candidates.set(roundedPoint(railing.end), railing.end);
+    const dx = railing.end.x - railing.start.x;
+    const dy = railing.end.y - railing.start.y;
+    const length = Math.hypot(dx, dy);
+    if (length < 1e-5) continue;
+    const count = Math.max(1, Math.round(length / BALCONY_RAILING_MODULE_SIZE));
+    const moduleLength = length / count;
+    const rotation = Math.atan2(dy, dx);
+    const elevation = (railing.elevationSteps ?? 0) * ROOM_ELEVATION_STEP;
+    for (let index = 0; index < count; index += 1) {
+      balconyRailings.push({
+        x: railing.start.x + Math.cos(rotation) * moduleLength * index,
+        y: railing.start.y + Math.sin(rotation) * moduleLength * index,
+        length: moduleLength,
+        rotation,
+        side: sideFromDirection(dx, dy),
+        variant: "A",
+        manualWallId: railing.id,
+        manualWallModuleIndex: index,
+        ...(elevation ? { elevation } : {}),
+      });
+    }
+  }
+
+  const balconyPillars: Pillar[] = [];
+  for (const point of candidates.values()) {
+    const elevations = new Set(manualRailings.filter((railing) => pointOnSegment(point, railing.start, railing.end))
+      .map((railing) => (railing.elevationSteps ?? 0) * ROOM_ELEVATION_STEP));
+    for (const elevation of elevations) {
+      const directions: PlanPoint[] = [];
+      for (const railing of manualRailings) {
+        if ((railing.elevationSteps ?? 0) * ROOM_ELEVATION_STEP !== elevation || !pointOnSegment(point, railing.start, railing.end)) continue;
+        for (const endpoint of [railing.start, railing.end]) {
+          const dx = endpoint.x - point.x;
+          const dy = endpoint.y - point.y;
+          const magnitude = Math.hypot(dx, dy);
+          if (magnitude < 1e-5) continue;
+          const direction = { x: dx / magnitude, y: dy / magnitude };
+          if (!directions.some((other) => Math.abs(other.x - direction.x) < 1e-4 && Math.abs(other.y - direction.y) < 1e-4)) directions.push(direction);
+        }
+      }
+      const nonCollinear = directions.some((first, index) => directions.slice(index + 1)
+        .some((second) => Math.abs(first.x * second.y - first.y * second.x) > 1e-4));
+      if (directions.length === 1 || nonCollinear) balconyPillars.push({ x: point.x, y: point.y, junction: true, variant: "A", ...(elevation ? { elevation } : {}) });
+    }
+  }
+  return { balconyRailings, balconyPillars };
+}
+
 function canonicalEdgeKey(a: PlanPoint, b: PlanPoint) {
   const forward = `${roundedPoint(a)}>${roundedPoint(b)}`;
   const reverse = `${roundedPoint(b)}>${roundedPoint(a)}`;
@@ -523,7 +698,9 @@ function addRoomGeometry(
       const boundaryVertices = new Set(geometry.grounds.flatMap((ground) => ground.outer)
         .map((point) => `${point.x.toFixed(4)},${point.y.toFixed(4)}`));
       cornerHandles.push(...sourceCorners.filter((corner) =>
-        boundaryVertices.has(`${(corner.vertexX * CELL_SIZE).toFixed(4)},${(corner.vertexY * CELL_SIZE).toFixed(4)}`),
+        // An edited vertex can be cut away from the resulting exterior boundary,
+        // but its control must remain available so the edit can be changed or reset.
+        Boolean(corner.edit) || boundaryVertices.has(`${(corner.vertexX * CELL_SIZE).toFixed(4)},${(corner.vertexY * CELL_SIZE).toFixed(4)}`),
       ));
     }
 
@@ -579,13 +756,16 @@ function addRoomGeometry(
   }
 }
 
-export function buildLayout(inputCells: Cell[], settings: BuildSettings, rooms: Room[] = []): GeneratedLayout {
+export function buildLayout(inputCells: Cell[], settings: BuildSettings, rooms: Room[] = [], manualWalls: ManualWall[] = [], wallDeletions: WallDeletion[] = [], floors: FloorRegion[] = []): GeneratedLayout {
   const cells = normalizeCells(inputCells);
   const keys = new Set(cells.map((cell) => cellKey(cell.x, cell.y)));
   const random = mulberry32(settings.randomSeed);
   const walls: WallSegment[] = [];
   const wallPaths: WallPath[] = [];
   const roomGrounds: RoomGround[] = [];
+  const floorGrounds: FloorGround[] = [];
+  const floorHitAreas: FloorGround[] = [];
+  const floorCornerHandles: CornerHandle[] = [];
   const roomHitAreas: RoomGround[] = [];
   const roomGroups: string[][] = [];
   const cornerHandles: CornerHandle[] = [];
@@ -593,12 +773,183 @@ export function buildLayout(inputCells: Cell[], settings: BuildSettings, rooms: 
   const wallResizeHandles: WallResizeHandle[] = [];
   let corners: never[] = [];
   let pillars: Pillar[] = [];
+  const wallManuals = manualWalls.filter((manual) => manual.assembly !== "balcony-railing");
+  const railingManuals = manualWalls.filter((manual) => manual.assembly === "balcony-railing");
+  const { balconyRailings, balconyPillars } = buildBalconyAssembly(railingManuals);
+  const elevationGroups = new Map<number, Room[]>();
+  for (const room of rooms) {
+    const elevationSteps = Number.isFinite(room.elevationSteps) ? (room.elevationSteps ?? 0) : 0;
+    const group = elevationGroups.get(elevationSteps) ?? [];
+    group.push(room);
+    elevationGroups.set(elevationSteps, group);
+  }
   if (rooms.length) {
-    addRoomGeometry(rooms, settings, walls, wallPaths, pillars, roomGrounds, roomHitAreas, roomGroups, cornerHandles, radiusHandles, wallResizeHandles);
+    // Each height is built as an independent footprint. Rooms still union and share walls
+    // exactly as before when they are on the same level, while stacked rooms never merge.
+    for (const [elevationSteps, levelRooms] of elevationGroups) {
+      const elevation = elevationSteps * ROOM_ELEVATION_STEP;
+      const starts = {
+        walls: walls.length,
+        wallPaths: wallPaths.length,
+        pillars: pillars.length,
+        roomGrounds: roomGrounds.length,
+        roomHitAreas: roomHitAreas.length,
+        cornerHandles: cornerHandles.length,
+        radiusHandles: radiusHandles.length,
+        wallResizeHandles: wallResizeHandles.length,
+      };
+      addRoomGeometry(levelRooms, settings, walls, wallPaths, pillars, roomGrounds, roomHitAreas, roomGroups, cornerHandles, radiusHandles, wallResizeHandles);
+      walls.slice(starts.walls).forEach((item) => { item.elevation = elevation; });
+      wallPaths.slice(starts.wallPaths).forEach((item) => { item.elevation = elevation; });
+      pillars.slice(starts.pillars).forEach((item) => { item.elevation = elevation; });
+      roomGrounds.slice(starts.roomGrounds).forEach((item) => { item.elevation = elevation; });
+      roomHitAreas.slice(starts.roomHitAreas).forEach((item) => { item.elevation = elevation; });
+      cornerHandles.slice(starts.cornerHandles).forEach((item) => { item.elevation = elevation; });
+      radiusHandles.slice(starts.radiusHandles).forEach((item) => { item.elevation = elevation; });
+      wallResizeHandles.slice(starts.wallResizeHandles).forEach((item) => { item.elevation = elevation; });
+    }
   } else {
     const runs = boundaryRuns(cells, keys);
     for (const run of runs) addPerimeterRun(walls, run, settings, random);
     ({ corners, pillars } = buildCornersAndPillars(cells, keys, settings));
+  }
+  // Independent floors use the room footprint editor only for its proven polygon and
+  // corner-edit maths. They never produce room walls, pillars, openings, or room unions.
+  for (const floor of floors) {
+    const elevationSteps = Number.isFinite(floor.elevationSteps) ? floor.elevationSteps : 0;
+    const elevation = elevationSteps * ROOM_ELEVATION_STEP;
+    const geometry = buildEditedRoomGeometry({
+      id: floor.id,
+      cells: floor.cells,
+      circles: [],
+      style: { innerWallVariant: settings.innerWallVariant, outerWallVariant: settings.outerWallVariant },
+      cornerEdits: floor.cornerEdits,
+      openings: [],
+      elevationSteps,
+    }, settings.curveQuality);
+    for (const ground of geometry.grounds) {
+      const stamped: FloorGround = { ...ground, floorId: floor.id, roomId: floor.id, variant: floor.variant, elevation };
+      floorGrounds.push(stamped);
+      floorHitAreas.push(stamped);
+    }
+    floorCornerHandles.push(...geometry.handles.map((handle) => ({ ...handle, elevation })));
+  }
+  for (const manual of wallManuals) {
+    const kind = manual.kind ?? "straight";
+    if (kind !== "straight") {
+      const sampleCount = Math.max(12, Math.ceil(Math.hypot(manual.end.x - manual.start.x, manual.end.y - manual.start.y) * 6));
+      const circular = kind === "curve" && manual.arcPoint
+        ? circularArcThroughPoints(manual.start, manual.arcPoint, manual.end)
+        : null;
+      const points = circular?.points ?? (kind === "curve" && manual.control
+        ? Array.from({ length: sampleCount + 1 }, (_, index) => {
+          const t = index / sampleCount;
+          const inverse = 1 - t;
+          return {
+            x: inverse * inverse * manual.start.x + 2 * inverse * t * manual.control!.x + t * t * manual.end.x,
+            y: inverse * inverse * manual.start.y + 2 * inverse * t * manual.control!.y + t * t * manual.end.y,
+          };
+        })
+        : [manual.start, manual.end]);
+      if (pathLength(points) >= 0.2) wallPaths.push({
+        points,
+        kind: kind === "curve" ? "curve" : "straight-exact",
+        roomId: `manual-${manual.id}`,
+        insideVariant: settings.innerWallVariant,
+        outsideVariant: settings.outerWallVariant,
+        manualWallId: manual.id,
+        elevation: (manual.elevationSteps ?? 0) * ROOM_ELEVATION_STEP,
+      });
+      continue;
+    }
+    const dx = manual.end.x - manual.start.x;
+    const dy = manual.end.y - manual.start.y;
+    const horizontal = Math.abs(dx) >= Math.abs(dy);
+    const length = horizontal ? Math.abs(dx) : Math.abs(dy);
+    if (length < CELL_SIZE - 1e-3) continue;
+    const count = Math.round(length / CELL_SIZE);
+    const rotation = horizontal ? (dx >= 0 ? 0 : Math.PI) : (dy >= 0 ? Math.PI / 2 : 3 * Math.PI / 2);
+    const side: Side = horizontal ? (dx >= 0 ? "S" : "N") : (dy >= 0 ? "E" : "W");
+    for (let index = 0; index < count; index += 1) {
+      walls.push({
+        x: manual.start.x + Math.cos(rotation) * index * CELL_SIZE,
+        y: manual.start.y + Math.sin(rotation) * index * CELL_SIZE,
+        length: CELL_SIZE,
+        rotation,
+        side,
+        variant: settings.wallVariant,
+        manualWallId: manual.id,
+        manualWallModuleIndex: index,
+        elevation: (manual.elevationSteps ?? 0) * ROOM_ELEVATION_STEP,
+      });
+    }
+  }
+  const manualJunctions = new Map<string, Set<"horizontal" | "vertical">>();
+  const manualConnections = new Map<string, Set<"E" | "W" | "N" | "S">>();
+  const addConnection = (x: number, y: number, direction: "E" | "W" | "N" | "S", elevation: number) => {
+    const key = `${x.toFixed(4)},${y.toFixed(4)},${elevation}`;
+    const directions = manualConnections.get(key) ?? new Set<"E" | "W" | "N" | "S">();
+    directions.add(direction);
+    manualConnections.set(key, directions);
+  };
+  for (const manual of wallManuals) {
+    if ((manual.kind ?? "straight") !== "straight") {
+      for (const point of [manual.start, manual.end]) {
+        const elevation = (manual.elevationSteps ?? 0) * ROOM_ELEVATION_STEP;
+        if (pillars.some((pillar) => Math.abs((pillar.elevation ?? 0) - elevation) < 1e-5 && Math.hypot(pillar.x - point.x, pillar.y - point.y) < 1e-3)) continue;
+        pillars.push({ x: point.x, y: point.y, junction: true, variant: settings.pillarVariant, ...(elevation ? { elevation } : {}) });
+      }
+      continue;
+    }
+    const dx = manual.end.x - manual.start.x;
+    const dy = manual.end.y - manual.start.y;
+    const horizontal = Math.abs(dx) >= Math.abs(dy);
+    const length = horizontal ? Math.abs(dx) : Math.abs(dy);
+    const count = Math.round(length / CELL_SIZE);
+    const direction = horizontal ? Math.sign(dx) : Math.sign(dy);
+    if (!direction || count < 1) continue;
+    for (let index = 0; index <= count; index += 1) {
+      const x = manual.start.x + (horizontal ? direction * index * CELL_SIZE : 0);
+      const y = manual.start.y + (horizontal ? 0 : direction * index * CELL_SIZE);
+      const key = `${x.toFixed(4)},${y.toFixed(4)},${(manual.elevationSteps ?? 0) * ROOM_ELEVATION_STEP}`;
+      const axes = manualJunctions.get(key) ?? new Set<"horizontal" | "vertical">();
+      axes.add(horizontal ? "horizontal" : "vertical");
+      manualJunctions.set(key, axes);
+    }
+    for (let index = 0; index < count; index += 1) {
+      const x = manual.start.x + (horizontal ? direction * index * CELL_SIZE : 0);
+      const y = manual.start.y + (horizontal ? 0 : direction * index * CELL_SIZE);
+      const nextX = x + (horizontal ? direction * CELL_SIZE : 0);
+      const nextY = y + (horizontal ? 0 : direction * CELL_SIZE);
+      if (horizontal) {
+        addConnection(x, y, direction > 0 ? "E" : "W", (manual.elevationSteps ?? 0) * ROOM_ELEVATION_STEP);
+        addConnection(nextX, nextY, direction > 0 ? "W" : "E", (manual.elevationSteps ?? 0) * ROOM_ELEVATION_STEP);
+      } else {
+        addConnection(x, y, direction > 0 ? "N" : "S", (manual.elevationSteps ?? 0) * ROOM_ELEVATION_STEP);
+        addConnection(nextX, nextY, direction > 0 ? "S" : "N", (manual.elevationSteps ?? 0) * ROOM_ELEVATION_STEP);
+      }
+    }
+  }
+  for (const [key, connections] of manualConnections) {
+    const axes = manualJunctions.get(key);
+    const isCornerOrJunction = Boolean(axes && axes.size >= 2);
+    const isOpenEnd = connections.size === 1;
+    if (!isCornerOrJunction && !isOpenEnd) continue;
+    const [x, y, elevation] = key.split(",").map(Number);
+    if (pillars.some((pillar) => Math.abs((pillar.elevation ?? 0) - elevation) < 1e-5 && Math.hypot(pillar.x - x, pillar.y - y) < 1e-3)) continue;
+    pillars.push({ x, y, junction: true, variant: settings.pillarVariant, ...(elevation ? { elevation } : {}) });
+  }
+  if (wallDeletions.length) {
+    const visible = walls.filter((wall) => {
+      const cx = wall.x + Math.cos(wall.rotation) * wall.length / 2;
+      const cy = wall.y + Math.sin(wall.rotation) * wall.length / 2;
+      const axis = Math.abs(Math.cos(wall.rotation)) >= Math.abs(Math.sin(wall.rotation)) ? "horizontal" : "vertical";
+      return !wallDeletions.some((deletion) => deletion.axis === axis
+        && (!deletion.roomId || deletion.roomId === wall.roomId || deletion.roomId === wall.opposingRoomId)
+        && Math.abs((deletion.elevation ?? 0) - (wall.elevation ?? 0)) < 1e-5
+        && Math.hypot(deletion.cx - cx, deletion.cy - cy) < 0.05);
+    });
+    walls.splice(0, walls.length, ...visible);
   }
   const externalWalls = walls.filter((wall) => !wall.opposingRoomId);
   const externalPaths = wallPaths.filter((path) => !path.opposingRoomId);
@@ -606,14 +957,16 @@ export function buildLayout(inputCells: Cell[], settings: BuildSettings, rooms: 
     + externalPaths.reduce((sum, path) => sum + pathLength(path.points), 0);
   const pathModules = wallPaths.reduce((sum, path) => sum + Math.max(1, Math.ceil(pathLength(path.points) / CELL_SIZE)), 0);
   const wallModules = walls.length + pathModules;
-  const shapeArea = roomGrounds.length
+  const roomArea = roomGrounds.length
     ? roomGrounds.reduce((sum, ground) => sum + polygonArea(ground.outer) - ground.holes.reduce((holeSum, hole) => holeSum + polygonArea(hole), 0), 0)
     : cells.length * CELL_SIZE * CELL_SIZE;
+  const floorArea = floorGrounds.reduce((sum, ground) => sum + polygonArea(ground.outer) - ground.holes.reduce((holeSum, hole) => holeSum + polygonArea(hole), 0), 0);
+  const shapeArea = roomArea + floorArea;
   // Room grounds are triangulated meshes, not discrete tiles, so the count comes from the
   // rendered area. A plain grid plan gives back exactly cells.length, while a merged room
   // counts its overlap once — which a per-part sum could not.
   const floorTiles = Math.round(shapeArea / (CELL_SIZE * CELL_SIZE));
-  const totalModules = floorTiles + wallModules + corners.length + pillars.length;
+  const totalModules = floorTiles + wallModules + corners.length + pillars.length + balconyRailings.length + balconyPillars.length;
 
   return {
     cells,
@@ -622,13 +975,25 @@ export function buildLayout(inputCells: Cell[], settings: BuildSettings, rooms: 
     wallPaths,
     corners,
     pillars,
+    balconyRailings,
+    balconyPillars,
     roomGrounds,
+    foundationGrounds: roomHitAreas.filter((ground) => rooms.some((room) => room.id === ground.roomId && (room.foundationHeight !== undefined ? Math.abs((ground.elevation ?? 0) - room.foundationHeight) < 0.00001 : (ground.elevation ?? 0) <= 0))),
+    floorGrounds,
+    floorHitAreas,
+    floorCornerHandles,
     roomHitAreas,
     roomGroups,
     cornerHandles,
     radiusHandles,
     wallResizeHandles,
-    bounds: getGroundBounds(roomGrounds, getBounds(cells)),
+    openings: [...rooms.flatMap((room) => room.openings ?? []), ...wallManuals.flatMap((wall) => wall.openings ?? [])].filter((opening) => !opening.suppressed),
+    bounds: manualWalls.length ? {
+      minX: Math.min(getGroundBounds([...roomGrounds, ...floorGrounds], getBounds(cells)).minX, ...manualWalls.flatMap((wall) => [wall.start.x, wall.end.x, wall.arcPoint?.x ?? wall.control?.x ?? wall.start.x])),
+      minY: Math.min(getGroundBounds([...roomGrounds, ...floorGrounds], getBounds(cells)).minY, ...manualWalls.flatMap((wall) => [wall.start.y, wall.end.y, wall.arcPoint?.y ?? wall.control?.y ?? wall.start.y])),
+      maxX: Math.max(getGroundBounds([...roomGrounds, ...floorGrounds], getBounds(cells)).maxX, ...manualWalls.flatMap((wall) => [wall.start.x, wall.end.x, wall.arcPoint?.x ?? wall.control?.x ?? wall.start.x])),
+      maxY: Math.max(getGroundBounds([...roomGrounds, ...floorGrounds], getBounds(cells)).maxY, ...manualWalls.flatMap((wall) => [wall.start.y, wall.end.y, wall.arcPoint?.y ?? wall.control?.y ?? wall.start.y])),
+    } : getGroundBounds([...roomGrounds, ...floorGrounds], getBounds(cells)),
     stats: {
       area: shapeArea,
       perimeter,
@@ -636,8 +1001,14 @@ export function buildLayout(inputCells: Cell[], settings: BuildSettings, rooms: 
       floorTiles,
       wallModules,
       cornerModules: corners.length,
-      pillarModules: pillars.length,
-      connectedRooms: countFloorZones(cells, keys, rooms.flatMap((room) => room.circles ?? [])),
+      pillarModules: pillars.length + balconyPillars.length,
+      connectedRooms: rooms.length
+        ? [...elevationGroups.values()].reduce((total, levelRooms) => {
+          const levelCells = normalizeCells(levelRooms.flatMap((room) => room.cells));
+          const levelKeys = new Set(levelCells.map((cell) => cellKey(cell.x, cell.y)));
+          return total + countFloorZones(levelCells, levelKeys, levelRooms.flatMap((room) => room.circles ?? []));
+        }, 0)
+        : countFloorZones(cells, keys, []),
       totalModules,
     },
   };

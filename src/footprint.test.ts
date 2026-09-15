@@ -45,6 +45,8 @@ const settings: BuildSettings = {
   hdriBackground: true,
   hdriIntensity: 1,
   hdriRotation: 0,
+  moduleWallVariant: "2",
+  modulePillarVariant: "1",
 };
 
 function room(id: string, x: number, y: number, width: number, depth: number): Room {
@@ -54,6 +56,7 @@ function room(id: string, x: number, y: number, width: number, depth: number): R
     circles: [],
     style: { innerWallVariant: id === "left" ? "A" : "B", outerWallVariant: "C" },
     cornerEdits: [],
+    openings: [],
   };
 }
 
@@ -64,6 +67,7 @@ function circleRoom(id: string, circle: CircleShape): Room {
     circles: [circle],
     style: { innerWallVariant: "A", outerWallVariant: "C" },
     cornerEdits: [],
+    openings: [],
   };
 }
 
@@ -254,6 +258,7 @@ function mixedRoom(cells: Room["cells"], circles: CircleShape[]): Room {
     circles,
     style: { innerWallVariant: "A", outerWallVariant: "C" },
     cornerEdits: [],
+    openings: [],
   };
 }
 
